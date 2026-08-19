@@ -1,0 +1,42 @@
+[
+  {
+    "filename": "018108_Ватьеганское_622_27_58.243_1061267.pdf",
+    "well_data": {
+      "field": "Ватьеганское",
+      "order": "1061267",
+      "depth": "2167 м",
+      "angle": "36,5°",
+      "temperature": "-6,36°C",
+      "volume": "49,98",
+      "start_date": "30.11.2025 10:00",
+      "end_date": "01.12.2025 03:00",
+      "duration_hours": "17.00 часов"
+    },
+    "comparison": {
+      "status": "unknown",
+      "pdf_temp": -6.36,
+      "table_temp": null,
+      "message": "Нет данных в таблице"
+    }
+  },
+  {
+    "filename": "018121_Повховское_1140_213_59.6_1061344.pdf",
+    "well_data": {
+      "field": "Повховское",
+      "order": "1061344",
+      "depth": "2955 м",
+      "angle": "24,89°",
+      "temperature": "0°C",
+      "volume": "78,01",
+      "start_date": "30.11.2025 18:00",
+      "end_date": "01.12.2025 08:00",
+      "duration_hours": "14.00 часов"
+    },
+    "comparison": {
+      "status": "unknown",
+      "pdf_temp": 0.0,
+      "table_temp": null,
+      "message": "Нет данных в таблице"
+    }
+  }
+]
