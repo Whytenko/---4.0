@@ -1426,7 +1426,8 @@ html = html.replace("__SVG_BATCH__", SVG_BATCH)
 def _run_cli_mode(argv):
     run_check = "--self-check" in argv
     run_smoke = "--smoke-test" in argv
-    if not run_check and not run_smoke:
+    run_verify_real = "--verify-real-input" in argv
+    if not run_check and not run_smoke and not run_verify_real:
         return None
 
     _configure_console_streams()
@@ -1442,6 +1443,11 @@ def _run_cli_mode(argv):
         smoke_result = run_smoke_test(max_files=2)
         print(format_smoke_report(smoke_result))
         if not smoke_result.get("ok"):
+            exit_code = 2
+
+    if run_verify_real:
+        from tools.verify_real_input import run as run_verify_real_input
+        if run_verify_real_input() != 0:
             exit_code = 2
 
     return exit_code

@@ -13,6 +13,26 @@ import pdfplumber
 # как это уже было).
 
 
+def classify_text(text: str) -> str:
+    """Определяет тип документа по тексту 1 страницы: 'zayavka' | 'akt_prostoy'
+    | 'akt_naryad'. Вынесено отдельно от classify_pdf(), чтобы логику
+    классификации можно было тестировать без реального PDF-файла."""
+    text = text or ""
+    stripped = text.strip()
+    upper = stripped.upper()
+
+    if upper.startswith("ЗАЯВКА") or re.search(r'ЗАЯВКА\s*№', upper):
+        return "zayavka"
+
+    # Требуем целую фразу "акт на простой", а не совпадение отдельных
+    # обрывков слов — иначе ложно срабатывает на словах вроде "пространстве"
+    # (подстрока "прост"), которые обычны в обычных актах-нарядах.
+    if re.search(r'акт\s+на\s+прост', upper, re.IGNORECASE):
+        return "akt_prostoy"
+
+    return "akt_naryad"
+
+
 def classify_pdf(pdf_path: Path) -> tuple[str, str]:
     """Возвращает (тип, текст 1 страницы). Тип: 'zayavka' | 'akt_prostoy' | 'akt_naryad'."""
     try:
@@ -22,19 +42,7 @@ def classify_pdf(pdf_path: Path) -> tuple[str, str]:
         return "akt_naryad", ""
 
     text = text or ""
-    stripped = text.strip()
-    upper = stripped.upper()
-
-    if upper.startswith("ЗАЯВКА") or re.search(r'ЗАЯВКА\s*№', upper):
-        return "zayavka", text
-
-    # Требуем целую фразу "акт на простой", а не совпадение отдельных
-    # обрывков слов — иначе ложно срабатывает на словах вроде "пространстве"
-    # (подстрока "прост"), которые обычны в обычных актах-нарядах.
-    if re.search(r'акт\s+на\s+прост', upper, re.IGNORECASE):
-        return "akt_prostoy", text
-
-    return "akt_naryad", text
+    return classify_text(text), text
 
 
 def parse_zayavka_text(text: str) -> dict:
