@@ -213,84 +213,45 @@ class API:
         return self._run_batch(copied_paths)
 
     def _run_batch(self, pdf_paths):
-        stdout_buffer = io.StringIO()
-        stderr_buffer = io.StringIO()
-        report_path = None
-        # Пусто, а не list(pdf_paths): если что-то упадёт раньше, чем цикл
-        # ниже успеет заполнить akt_paths по-настоящему, вывод честно
-        # покажет 0 обработанных актов, а не введёт в заблуждение, будто
-        # все файлы из пакета были разобраны как акты.
-        akt_paths = []
-        zayavki = []
-        prostoy_files = []
-        try:
-            from src.extractors.main_parser import PDFProcessor
-            from src.extractors.doc_linking import (
-                classify_pdf,
-                parse_zayavka_text,
-                apply_zayavka_checks,
-            )
-            from src.utils.batch_report import build_batch_report
+        """Тонкая обёртка над batch_pipeline.run_batch_pipeline() — сам
+        разбор пакета живёт там, здесь только форматирование вывода для UI
+        и открытие готового отчёта в системном приложении."""
+        from src.extractors.batch_pipeline import run_batch_pipeline
 
-            # Разделяем пакет: заявки идут на сверку (не как отдельные акты),
-            # акты на простой — пока только фиксируются (см. примечание в выводе),
-            # всё остальное обрабатывается как акт-наряд, как и раньше.
-            akt_paths = []
-            for path in pdf_paths:
-                kind, text = classify_pdf(path)
-                if kind == "zayavka":
-                    record = parse_zayavka_text(text)
-                    record["filename"] = path.name
-                    zayavki.append(record)
-                elif kind == "akt_prostoy":
-                    prostoy_files.append(path.name)
-                else:
-                    akt_paths.append(path)
-
-            processor = PDFProcessor()
-            with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
-                wells_data = processor.process_pdfs(akt_paths)
-                if zayavki:
-                    apply_zayavka_checks(wells_data, zayavki)
-                processor.print_all_results()
-            if akt_paths:
-                report_path = build_batch_report(akt_paths, wells_data)
-        except Exception:
-            traceback.print_exc(file=stderr_buffer)
+        result = run_batch_pipeline(pdf_paths)
 
         output = "🚀 ПАКЕТНАЯ ПРОВЕРКА\n"
-        output += f"Файлов в пакете: {len(pdf_paths)} (актов: {len(akt_paths)}"
-        if zayavki:
-            output += f", заявок: {len(zayavki)}"
-        if prostoy_files:
-            output += f", актов на простой: {len(prostoy_files)}"
+        output += f"Файлов в пакете: {len(pdf_paths)} (актов: {len(result.akt_paths)}"
+        if result.zayavki:
+            output += f", заявок: {len(result.zayavki)}"
+        if result.prostoy_files:
+            output += f", актов на простой: {len(result.prostoy_files)}"
         output += ")\n"
-        if prostoy_files:
+        if result.prostoy_files:
             output += (
                 "⚠️ Автосверка актов на простой с тех.дежурством пока не реализована — "
-                f"проверьте вручную: {', '.join(prostoy_files)}\n"
+                f"проверьте вручную: {', '.join(result.prostoy_files)}\n"
             )
         output += f"Папка данных: {self.runtime_root}\n"
         output += "=" * 50 + "\n\n"
-        output += stdout_buffer.getvalue()
+        output += result.stdout_text
 
-        stderr = stderr_buffer.getvalue()
-        if stderr:
+        if result.stderr_text:
             output += "\n" + "─" * 50 + "\n"
             output += "⚠️  ОШИБКИ:\n"
             output += "─" * 50 + "\n"
-            output += stderr
+            output += result.stderr_text
 
         output += "\n" + "=" * 50 + "\n"
-        if report_path:
-            output += f"✅ Сводный отчёт сохранён: {report_path}\n"
+        if result.report_path:
+            output += f"✅ Сводный отчёт сохранён: {result.report_path}\n"
             try:
                 if sys.platform == "win32":
-                    os.startfile(report_path)
+                    os.startfile(result.report_path)
                 elif sys.platform == "darwin":
-                    subprocess.Popen(["open", str(report_path)])
+                    subprocess.Popen(["open", str(result.report_path)])
                 else:
-                    subprocess.Popen(["xdg-open", str(report_path)])
+                    subprocess.Popen(["xdg-open", str(result.report_path)])
             except Exception:
                 pass
         else:
