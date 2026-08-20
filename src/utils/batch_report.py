@@ -101,6 +101,7 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
         )
 
     df = pd.DataFrame(rows)
+    registry_df = _build_registry_df(wells_data)
 
     output_dir = get_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -108,11 +109,57 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
     report_path = output_dir / f"Отчет по пакету актов {timestamp}.xlsx"
 
     with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
+        registry_df.to_excel(writer, index=False, sheet_name="Реестр")
+        _autosize_columns(writer.sheets["Реестр"], registry_df)
+
         df.to_excel(writer, index=False, sheet_name="Сводка")
-        worksheet = writer.sheets["Сводка"]
-        for col_idx, col_name in enumerate(df.columns, start=1):
-            max_len = max([len(str(col_name))] + [len(str(v)) for v in df[col_name].astype(str)])
-            worksheet.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 45)
-        worksheet.freeze_panes = "A2"
+        _autosize_columns(writer.sheets["Сводка"], df)
 
     return report_path
+
+
+def _autosize_columns(worksheet, df: pd.DataFrame) -> None:
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        max_len = max([len(str(col_name))] + [len(str(v)) for v in df[col_name].astype(str)])
+        worksheet.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 45)
+    worksheet.freeze_panes = "A2"
+
+
+def _build_registry_df(wells_data: List) -> pd.DataFrame:
+    """Реестр в формате заказчика ("Проверка акт-нарядов ГГГГ.xlsx"):
+    № Договора / № Заказа / Месторождение / Скважина / Куст / № Акт-Наряда /
+    Дата предоставления / Окончание работ / Стоимость / Проведенный ГИС /
+    Заявка / Комментарии. Второй "№ п/п" — порядковый номер внутри одной
+    "Дата предоставления" (сбрасывается на 1 при смене даты) — так же, как
+    в реестре заказчика, где акты группируются по дню поступления."""
+    rows = []
+    seen_per_date: dict = {}
+    for well_data in wells_data:
+        act_date = well_data.act_date or ""
+        seen_per_date[act_date] = seen_per_date.get(act_date, 0) + 1
+        rows.append(
+            {
+                "№ п/п": len(rows) + 1,
+                "№ п/п ": seen_per_date[act_date],
+                "№ Договора": well_data.contract_number_display,
+                "№ Заказа": well_data.order,
+                "Месторождение": well_data.field,
+                "Скважина": well_data.well_number,
+                "Куст": well_data.bush,
+                "№ Акт-Наряда": well_data.act_number,
+                "Дата предоставления": act_date,
+                "Окончание работ": well_data.end_date,
+                "Стоимость": _to_number(well_data.total_cost),
+                "Проведенный ГИС": well_data.performed_tasks,
+                "Заявка": well_data.matched_zayavka_task,
+                "Комментарии": "",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _to_number(value: str):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return ""
