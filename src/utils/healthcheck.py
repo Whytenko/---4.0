@@ -36,6 +36,16 @@ REQUIRED_REFERENCE_FILES = (
     "tabale_rascenki.csv",
 )
 
+# Опциональные справочники — при отсутствии код тихо откатывается на
+# зашитые дефолты (main_parser._load_contract_coefficients() /
+# FinalUnifiedParser._load_party_keywords()), поэтому отсутствие — не
+# ошибка, а предупреждение (эти CSV просто позволяют править
+# коэффициенты/ключевые слова без изменения кода).
+OPTIONAL_REFERENCE_FILES = (
+    "coeff_dogovor.csv",
+    "integral_party_keywords.csv",
+)
+
 
 def _item(name: str, status: str, detail: str, path: Path | None = None, hint: str = "") -> CheckItem:
     return CheckItem(
@@ -167,6 +177,21 @@ def run_self_check(write_logs: bool = True) -> Dict[str, object]:
                     "Required reference file not found",
                     file_path,
                     "Copy reference file to runtime/reference or reinstall package.",
+                )
+            )
+
+    for filename in OPTIONAL_REFERENCE_FILES:
+        file_path = ref_dir / filename
+        if file_path.exists():
+            checks.append(_item(f"reference:{filename}", "ok", "Reference file exists", file_path))
+        else:
+            checks.append(
+                _item(
+                    f"reference:{filename}",
+                    "warn",
+                    "Optional reference file not found — using built-in defaults",
+                    file_path,
+                    "Add this CSV to reference/ to override built-in defaults without a code change.",
                 )
             )
 

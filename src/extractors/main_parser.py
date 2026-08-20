@@ -25,12 +25,66 @@ from src.utils.app_paths import (
     get_resource_roots,
 )
 
-# Коэффициент по договору (см. "Инструкцию по проверке акт-нарядов 2026") —
-# обновлять при заключении новых договоров.
-CONTRACT_COEFFICIENTS = {
+# Зашитые дефолты на случай, если справочные CSV в reference/ отсутствуют
+# (например до первого копирования бандла). Основной, редактируемый на
+# месте источник — reference/coeff_dogovor.csv и
+# reference/integral_party_keywords.csv (см. _load_contract_coefficients()
+# и FinalUnifiedParser._load_party_keywords() ниже).
+_DEFAULT_CONTRACT_COEFFICIENTS = {
     "2026008065": 1.33,
     "2025031516": 1.228,
 }
+
+_DEFAULT_INTEGRAL_PARTY_KEYWORDS = (
+    "услуги",
+    "всп.раб",  # "Всп.работы", "Всп. работы", "Всп.раб." — варианты написания встречаются все
+    "вспомогательныеработы",
+    "калибровк",
+    "тех.дежурство",
+    "технологическоедежурство",
+    "работакомпл.партии",
+    "работапартии",
+    "переезд",
+    "дефект",  # дефектоскопия, "дефект.и толщин."
+    "толщинометри",
+    "спецкаб",  # работы спецкабелем — угол не влияет (эмпирически, реальные акты)
+)
+
+_contract_coefficients_cache: dict | None = None
+
+
+def _load_contract_coefficients() -> dict:
+    """Коэффициенты по номеру договора — редактируемый справочник
+    reference/coeff_dogovor.csv (колонки contract_number, coefficient).
+    Правка коэффициента/добавление нового договора — правка этого CSV в
+    рантайм-папке (AppData), без изменения кода. Если файла нет —
+    используются зашитые дефолты."""
+    global _contract_coefficients_cache
+    if _contract_coefficients_cache is not None:
+        return _contract_coefficients_cache
+
+    csv_path = get_reference_dir() / "coeff_dogovor.csv"
+    if csv_path.exists():
+        try:
+            df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+            result = {}
+            for _, row in df.iterrows():
+                number = str(row.iloc[0]).strip()
+                if not number:
+                    continue
+                try:
+                    coeff = float(str(row.iloc[1]).strip().replace(",", "."))
+                except Exception:
+                    continue
+                result[number] = coeff
+            if result:
+                _contract_coefficients_cache = result
+                return _contract_coefficients_cache
+        except Exception:
+            pass
+
+    _contract_coefficients_cache = dict(_DEFAULT_CONTRACT_COEFFICIENTS)
+    return _contract_coefficients_cache
 
 @dataclass
 class WellData:
@@ -293,7 +347,7 @@ class WellData:
         }
 
     def _check_contract_coefficient(self) -> dict:
-        expected = CONTRACT_COEFFICIENTS.get(self.contract_number)
+        expected = _load_contract_coefficients().get(self.contract_number)
         if not self.contract_number or expected is None:
             return {"status": "neutral"}
         if self.contract_coeff_value is None:
@@ -476,6 +530,7 @@ class WellData:
 class FinalUnifiedParser:
     """Финальный объединенный парсер ВСЕХ данных"""
     _rate_reference_cache: dict | None = None
+    _party_keywords_cache: tuple | None = None
     
     def parse_all(self, pdf_path: str) -> WellData:
         """Парсит ВСЕ значения включая даты и возвращает объект WellData"""
@@ -699,6 +754,33 @@ class FinalUnifiedParser:
             for key, values in rates.items()
         }
         return self._rate_reference_cache
+
+    def _load_party_keywords(self) -> tuple:
+        """Ключевые слова для классификации строк расценок (влияет ли угол
+        наклона на интегральный коэффициент строки) — редактируемый
+        справочник reference/integral_party_keywords.csv. Если файла нет
+        (например на чистой установке до первого копирования бандла) —
+        используется зашитый по умолчанию список."""
+        if self._party_keywords_cache is not None:
+            return self._party_keywords_cache
+
+        csv_path = get_reference_dir() / "integral_party_keywords.csv"
+        if csv_path.exists():
+            try:
+                df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+                keywords = tuple(
+                    str(value).strip().lower()
+                    for value in df.iloc[:, 0].tolist()
+                    if str(value).strip()
+                )
+                if keywords:
+                    self._party_keywords_cache = keywords
+                    return self._party_keywords_cache
+            except Exception:
+                pass
+
+        self._party_keywords_cache = _DEFAULT_INTEGRAL_PARTY_KEYWORDS
+        return self._party_keywords_cache
 
     def _extract_rate_rows_from_table(self, table: list) -> List[dict]:
         if not table:
@@ -1028,32 +1110,9 @@ class FinalUnifiedParser:
         status = "bad" if status_is_bad else "ok"
         return status, summary_lines + details
 
-    # Строки расценок, для которых интегральный коэффициент считается только
-    # по температуре (услуги/ПЗР, вспом. работы, калибровка, тех.дежурство,
-    # переезды, работы спецкабелем/дефектоскопия) — по Приложению №6 к
-    # ЕНВиР-99-Л-3С угол наклона на них не влияет. Всё остальное (собственно
-    # скважинные исследования, спуск-подъём прибора) — оба фактора.
-    # Ключевые слова без пробелов — сравниваются с именем строки после
-    # удаления всех пробелов (в реальных актах написание "Всп.работы" /
-    # "Всп. работы" встречается непоследовательно).
-    _INTEGRAL_PARTY_ONLY_KEYWORDS = (
-        "услуги",
-        "всп.раб",  # "Всп.работы", "Всп. работы", "Всп.раб." — варианты написания встречаются все
-        "вспомогательныеработы",
-        "калибровк",
-        "тех.дежурство",
-        "технологическоедежурство",
-        "работакомпл.партии",
-        "работапартии",
-        "переезд",
-        "дефект",  # дефектоскопия, "дефект.и толщин."
-        "толщинометри",
-        "спецкаб",  # работы спецкабелем — угол не влияет (эмпирически, реальные акты)
-    )
-
     def _classify_integral_work_type(self, name: str) -> str:
         norm = re.sub(r"\s+", "", name.lower())
-        for keyword in self._INTEGRAL_PARTY_ONLY_KEYWORDS:
+        for keyword in self._load_party_keywords():
             if keyword in norm:
                 return "party"
         return "well"
@@ -1138,8 +1197,8 @@ class FinalUnifiedParser:
 
     def _parse_contract_number(self, text: str) -> str:
         """Номер договора (только числовой формат — учитываются лишь
-        договоры из CONTRACT_COEFFICIENTS; старые буквенно-цифровые номера
-        вроде '22С3286' для этой проверки не применимы)."""
+        договоры из reference/coeff_dogovor.csv; старые буквенно-цифровые
+        номера вроде '22С3286' для этой проверки не применимы)."""
         match = re.search(r'[Дд]оговор[а-я]*\s*№\s*([0-9]{6,})', text)
         return match.group(1) if match else ""
 
