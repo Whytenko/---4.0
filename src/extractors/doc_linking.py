@@ -102,12 +102,15 @@ def _parse_field(text: str) -> str:
 
 
 def _parse_bush(text: str) -> str:
-    match = re.search(r'куст\w*\s*№?\s*([0-9]+)', text, re.IGNORECASE)
+    # Номер куста может иметь буквенный суффикс ("35А", "90Б") — как и в
+    # акте (main_parser._parse_well_and_bush), иначе сравнение по кусту в
+    # match_zayavka_for_well не совпадёт из-за отброшенной буквы.
+    match = re.search(r'куст\w*\s*№?\s*([0-9]+[А-Яа-я]?)', text, re.IGNORECASE)
     return match.group(1) if match else ""
 
 
 def _parse_well_number(text: str) -> str:
-    match = re.search(r'скважин\w*\s*№\s*([0-9]+)', text, re.IGNORECASE)
+    match = re.search(r'скважин\w*\s*№\s*([0-9]+[А-Яа-я]?)', text, re.IGNORECASE)
     return match.group(1) if match else ""
 
 
@@ -192,7 +195,12 @@ def check_against_zayavka(well_data, zayavka: Optional[dict]) -> dict:
     if not details:
         details = [f"Совпадает с заявкой: {zayavka.get('filename', '')}"]
 
-    return {"status": status, "details": details, "matched_zayavka": zayavka.get("filename")}
+    return {
+        "status": status,
+        "details": details,
+        "matched_zayavka": zayavka.get("filename"),
+        "zayavka_task": zayavka.get("task", ""),
+    }
 
 
 def apply_zayavka_checks(wells_data: List, zayavki: List[dict]) -> None:
@@ -204,3 +212,4 @@ def apply_zayavka_checks(wells_data: List, zayavki: List[dict]) -> None:
         result = check_against_zayavka(well_data, match)
         well_data.zayavka_check_status = result["status"]
         well_data.zayavka_check_details = result.get("details", [])
+        well_data.matched_zayavka_task = result.get("zayavka_task", "")

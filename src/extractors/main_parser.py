@@ -4,7 +4,7 @@ import re
 import os
 import pdfplumber
 from pathlib import Path
-from typing import ClassVar, List
+from typing import ClassVar, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 import sys
@@ -127,6 +127,20 @@ class WellData:
     bush: str = ""
     zayavka_check_status: str = ""
     zayavka_check_details: List[str] = field(default_factory=list)
+    # Номер сопоставленной заявки (задача) — для реестра "Проверка
+    # акт-нарядов", колонка "Заявка".
+    matched_zayavka_task: str = ""
+    # Поля для реестра "Проверка акт-нарядов" (выгрузка по шаблону
+    # заказчика): номер и дата самого акт-наряда (не заказа/договора),
+    # буквенно-цифровой номер договора для отображения (в отличие от
+    # contract_number — тот хранит только числовой формат, нужный
+    # исключительно для проверки коэффициента по reference/coeff_dogovor.csv)
+    # и итоговая сумма к оплате.
+    act_number: str = ""
+    act_date: str = ""
+    contract_number_display: str = ""
+    total_cost: str = ""
+    performed_tasks: str = ""
     # Результаты доп.проверок, вычисленных в parse_all из строк расценок
     # (барометрия@53, тех.дежурство >4ч, пересечение термометрии 200/500)
     check_results: dict = field(default_factory=dict)
@@ -537,15 +551,29 @@ class FinalUnifiedParser:
         ensure_runtime_layout(copy_reference=True)
         try:
             with pdfplumber.open(pdf_path) as pdf:
-                text = pdf.pages[0].extract_text() if pdf.pages else ""
+                # Титульный лист и Приложение №1 ищем по содержимому, а не по
+                # фиксированному номеру страницы: реальные акты сдвигают эти
+                # разделы (лишний лист согласования, заявка/акт готовности,
+                # склеенные в тот же PDF, или вовсе обратный порядок листов —
+                # см. 000088_*.pdf и 12459_*.pdf среди реальных актов).
+                header_idx = self._find_page_index(pdf, ("Выполнение комплекса ГИРС по Договору",))
+                if header_idx is None:
+                    header_idx = 0
+                prilozhenie_idx = self._find_page_index(pdf, ("Приложение №1", "Приложение N1", "Приложение N°1"))
+
+                text = pdf.pages[header_idx].extract_text() if pdf.pages else ""
                 all_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-                
+
                 filename = os.path.basename(pdf_path)
-                
+
                 # Вычисляем vm_count один раз (используется дважды)
                 vm_count_val = self._parse_vm_count(all_text)
-                # OCR страницы 2 вызывается один раз
-                page2_start, page2_end = self._parse_page2_start_end(pdf)
+                # OCR страницы со сканом «АКТ-ЗАКАЗ» вызывается один раз
+                scan_candidates = self._resolve_scan_candidates(pdf, header_idx, prilozhenie_idx)
+                page2_start, page2_end, scan_idx = self._parse_page2_start_end(pdf, scan_candidates)
+                vm_table_page_idx = scan_idx if scan_idx is not None else (
+                    scan_candidates[0] if scan_candidates else header_idx + 1
+                )
 
                 well_data = WellData(
                     filename=filename,
@@ -560,9 +588,9 @@ class FinalUnifiedParser:
                     vm_price=self._parse_vm_price(all_text),
                     vm_count=vm_count_val,
                     vm_total=self._parse_vm_total(all_text),
-                    vm_table_count=self._parse_vm_table_count(pdf, vm_count_val),
+                    vm_table_count=self._parse_vm_table_count(pdf, vm_count_val, vm_table_page_idx),
                     volume_sum_page1=self._parse_volume_sum_page1(text),
-                    qty_sum_page3=self._parse_qty_sum_page3(pdf),
+                    qty_sum_page3=self._parse_qty_sum_page3(pdf, prilozhenie_idx),
                     page2_start=page2_start,
                     page2_end=page2_end,
                     start_date=self._parse_date(text, 'начало'),
@@ -573,8 +601,12 @@ class FinalUnifiedParser:
                 well_data.contract_number = self._parse_contract_number(text)
                 well_data.contract_coeff_value = self._parse_contract_coefficient_from_act(text)
                 well_data.well_number, well_data.bush = self._parse_well_and_bush(text)
+                well_data.contract_number_display = self._parse_contract_number_display(text)
+                well_data.act_number, well_data.act_date = self._parse_act_number_and_date(text)
+                well_data.total_cost = self._parse_total_cost(text)
+                well_data.performed_tasks = self._parse_performed_tasks(text)
 
-                rate_rows = self._extract_rate_rows_page1(pdf)
+                rate_rows = self._extract_rate_rows_page1(pdf, header_idx)
                 rate_status, rate_details = self._check_rate_prices_from_rows(rate_rows)
                 well_data.rate_check_status = rate_status
                 well_data.rate_check_details = rate_details
@@ -593,7 +625,7 @@ class FinalUnifiedParser:
                 well_data.check_results["thermometry_overlap"] = well_data._check_thermometry_overlap(rate_rows)
 
                 if well_data.start_date == "не найдено" or well_data.end_date == "не найдено":
-                    start_ocr, end_ocr = self._parse_page1_dates_ocr(pdf)
+                    start_ocr, end_ocr = self._parse_page1_dates_ocr(pdf, header_idx)
                     if well_data.start_date == "не найдено" and start_ocr:
                         well_data.start_date = start_ocr
                     if well_data.end_date == "не найдено" and end_ocr:
@@ -923,10 +955,10 @@ class FinalUnifiedParser:
 
         return rows
 
-    def _extract_rate_rows_page1(self, pdf) -> List[dict]:
-        if not pdf.pages:
+    def _extract_rate_rows_page1(self, pdf, page_idx: int = 0) -> List[dict]:
+        if not pdf.pages or page_idx >= len(pdf.pages):
             return []
-        page = pdf.pages[0]
+        page = pdf.pages[page_idx]
         tables = page.extract_tables() or []
         rows: List[dict] = []
         for table in tables:
@@ -1195,12 +1227,48 @@ class FinalUnifiedParser:
         match = re.search(r'Задача\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)', text)
         return match.group(1) if match else ""
 
+    def _parse_performed_tasks(self, text: str) -> str:
+        """Все задачи, перечисленные в шапке акта ('Задача №54.1', 'Задача
+        №53' — акт может выполнять сразу несколько), объединённые через
+        '+' в порядке появления — колонка "Проведенный ГИС" в реестре
+        "Проверка акт-нарядов" (в отличие от task_number, берущего только
+        первую — она нужна для сверки с заявкой и спецкейса недохода)."""
+        matches = re.findall(r'Задача\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)', text)
+        return "+".join(matches)
+
     def _parse_contract_number(self, text: str) -> str:
         """Номер договора (только числовой формат — учитываются лишь
         договоры из reference/coeff_dogovor.csv; старые буквенно-цифровые
         номера вроде '22С3286' для этой проверки не применимы)."""
         match = re.search(r'[Дд]оговор[а-я]*\s*№\s*([0-9]{6,})', text)
         return match.group(1) if match else ""
+
+    def _parse_contract_number_display(self, text: str) -> str:
+        """Номер договора в исходном виде (буквенно-цифровой, напр.
+        '23С1816', '22С3286') — для реестра "Проверка акт-нарядов", в
+        отличие от _parse_contract_number(), который берёт только числовой
+        формат ради сверки коэффициента."""
+        match = re.search(r'по Договору\s*№\s*([0-9A-ZА-Я]+)', text)
+        return match.group(1) if match else ""
+
+    def _parse_act_number_and_date(self, text: str) -> tuple[str, str]:
+        """Номер и дата акт-наряда из строки 'АКТ - НАРЯД № 00079 от
+        06.01.2026' (буква после дефиса иногда распознаётся как латинская
+        H вместо кириллической Н). Ведущие нули в номере отбрасываются —
+        так же, как они показаны в реестре заказчика ('00079' -> '79')."""
+        match = re.search(r'АКТ\s*-\s*[HН]?АРЯД\s*№\s*(\d+)\s*от\s*(\d{2}\.\d{2}\.\d{4})', text)
+        if not match:
+            return "", ""
+        number = str(int(match.group(1)))
+        return number, match.group(2)
+
+    def _parse_total_cost(self, text: str) -> str:
+        """Итоговая сумма к оплате по акту ('Всего к оплате 170 372,13')."""
+        match = re.search(r'Всего к оплате\s+([\d\s]+,\d+)', text)
+        if not match:
+            return ""
+        value = match.group(1).replace(" ", "").replace(",", ".")
+        return value
 
     def _parse_contract_coefficient_from_act(self, text: str) -> float | None:
         """Значение из строки 'Всего с учетом коэффициента' на 1 странице акта."""
@@ -1213,8 +1281,17 @@ class FinalUnifiedParser:
             return None
 
     def _parse_well_and_bush(self, text: str) -> tuple[str, str]:
-        """Номер скважины и куста из строки 'Номер скважины / куст.......1867 / 151'."""
-        match = re.search(r'Номер скважины\s*/\s*куст[\.\s]*(\d+)\s*/\s*(\d+)', text)
+        """Номер скважины и куста из строки 'Номер скважины / куст.......1867 / 151'.
+        И номер скважины, и номер куста может иметь буквенный суффикс
+        ('1996Л', '35А', '90Б') — это часть самого номера, а не опечатка,
+        и без учёта суффикса матч проваливался целиком (не находилось ни
+        скважины, ни куста) либо куст обрезался до одних цифр.
+        Заполнитель между "куст" и номером — не только точки/пробелы, но и
+        символ многоточия "…" (используется в реальных актах), поэтому
+        [^\\d]* (любые не-цифры) надёжнее, чем [.\\s]*."""
+        match = re.search(
+            r'Номер скважины\s*/\s*куст[^\d]*(\d+[А-Яа-яA-Za-z]*)\s*/\s*(\d+[А-Яа-яA-Za-z]*)', text
+        )
         if match:
             return match.group(1), match.group(2)
         return "", ""
@@ -1774,8 +1851,10 @@ class FinalUnifiedParser:
                     return lines[i + 1]
         return ""
 
-    def _parse_vm_table_count(self, pdf, expected_count: str = "") -> str:
-        if len(pdf.pages) < 2:
+    def _parse_vm_table_count(self, pdf, expected_count: str = "", page_idx: Optional[int] = None) -> str:
+        if page_idx is None:
+            page_idx = 1
+        if len(pdf.pages) <= page_idx:
             return ""
         try:
             import pytesseract
@@ -1784,7 +1863,7 @@ class FinalUnifiedParser:
             return ""
         if not self._configure_tesseract(pytesseract):
             return ""
-        page = pdf.pages[1]
+        page = pdf.pages[page_idx]
         height = page.height
         width = page.width
         boxes = [
@@ -1829,6 +1908,22 @@ class FinalUnifiedParser:
             }
             return "".join(repl.get(ch, ch) for ch in s).lower()
 
+        # Останавливаемся на ПЕРВОЙ строке-подытоге после раздела скважинных
+        # исследований — дальше идут доп.работы/переезд/километраж, которые
+        # не входят в "объем работ" (это отдельная категория, сверяемая
+        # отдельно с отчётом по километражу). Разные типы актов называют
+        # этот первый подытог по-разному ("Стоимость скважинных исследований..."
+        # с барометрией/термометрией, но "Стоимость договорных расценок" для
+        # актов с одной расценкой без разбивки) — раньше распознавалась
+        # только первая формулировка, и для второго типа подсчёт продолжался
+        # дальше в строки километража, завышая сумму.
+        stop_markers = (
+            "стоимость скважинных исследований",
+            "стоимость договорных расценок",
+            "стоимость дополнительных работ",
+            "стоимость проезда",
+            "общий пробег кабеля",
+        )
         lines = text.splitlines()
         in_table = False
         total = 0.0
@@ -1839,7 +1934,7 @@ class FinalUnifiedParser:
                 continue
             if not in_table:
                 continue
-            if "стоимость скважинных исследований" in norm:
+            if any(marker in norm for marker in stop_markers):
                 break
             numbers = re.findall(r'\d+,\d+', line)
             if len(numbers) >= 3:
@@ -1850,10 +1945,49 @@ class FinalUnifiedParser:
                     continue
         return f"{total:.2f}" if total > 0 else ""
 
-    def _parse_qty_sum_page3(self, pdf) -> str:
-        if len(pdf.pages) < 3:
+    def _find_page_index(self, pdf, markers: tuple) -> Optional[int]:
+        """Ищет страницу, чей текст содержит один из markers, вместо того
+        чтобы полагаться на жёстко зашитый номер страницы — реальные акты
+        не всегда кладут титульный лист/Приложение №1 на одну и ту же
+        физическую страницу (напр. 12459_*.pdf: титул на последней странице,
+        Приложение №1 — на второй)."""
+        for idx, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            if any(marker in text for marker in markers):
+                return idx
+        return None
+
+    def _resolve_scan_candidates(self, pdf, header_idx: int, prilozhenie_idx: Optional[int]) -> list:
+        """Список кандидатов в физические страницы для скана «АКТ-ЗАКАЗ»
+        (Начало работы на объекте / Окончание работы партии): сначала
+        страницы сразу после титульного листа (обычный случай, со сдвигом
+        на лист согласования при необходимости), затем — сразу перед ним
+        (на случай, если титул не первый, как в 12459_*.pdf)."""
+        n = len(pdf.pages)
+        exclude = {header_idx}
+        if prilozhenie_idx is not None:
+            exclude.add(prilozhenie_idx)
+        candidates: list = []
+        offset = 1
+        while len(candidates) < 4 and header_idx + offset < n:
+            idx = header_idx + offset
+            if idx not in exclude:
+                candidates.append(idx)
+            offset += 1
+        offset = 1
+        while len(candidates) < 6 and header_idx - offset >= 0:
+            idx = header_idx - offset
+            if idx not in exclude and idx not in candidates:
+                candidates.append(idx)
+            offset += 1
+        return candidates
+
+    def _parse_qty_sum_page3(self, pdf, page_idx: Optional[int] = None) -> str:
+        if page_idx is None:
+            page_idx = 2
+        if len(pdf.pages) <= page_idx:
             return ""
-        text = pdf.pages[2].extract_text() or ""
+        text = pdf.pages[page_idx].extract_text() or ""
         lines = text.splitlines()
         total = 0.0
         for line in lines:
@@ -1867,9 +2001,25 @@ class FinalUnifiedParser:
             total += last_three[1]
         return f"{total:.2f}" if total > 0 else ""
 
-    def _parse_page2_start_end(self, pdf):
-        if len(pdf.pages) < 2:
-            return "", ""
+    def _parse_page2_start_end(self, pdf, candidate_indices=None):
+        """Ищет страницу со сканом «АКТ-ЗАКАЗ» (Начало работы на объекте /
+        Окончание работы партии) среди candidate_indices, пробуя OCR на
+        каждой по очереди — реальные акты не всегда кладут этот скан на
+        физическую страницу 2: если между титульным листом и сканом вставлен
+        лист согласования («ОТ ПОДРЯДЧИКА/ОТ ЗАКАЗЧИКА»), скан сдвигается на
+        страницу 3 и жёстко зашитый индекс 1 промахивается мимо него молча
+        (см. 000088_*.pdf среди реальных актов)."""
+        if candidate_indices is None:
+            candidate_indices = [1] if len(pdf.pages) > 1 else []
+        for idx in candidate_indices:
+            if idx < 0 or idx >= len(pdf.pages):
+                continue
+            start, end = self._ocr_page_start_end(pdf.pages[idx])
+            if start and end:
+                return start, end, idx
+        return "", "", None
+
+    def _ocr_page_start_end(self, page) -> tuple[str, str]:
         try:
             import pytesseract
             from PIL import ImageOps
@@ -1877,7 +2027,6 @@ class FinalUnifiedParser:
             return "", ""
         if not self._configure_tesseract(pytesseract):
             return "", ""
-        page = pdf.pages[1]
         h = page.height
         w = page.width
         # Crop the right-middle block with start/end lines
@@ -1959,8 +2108,8 @@ class FinalUnifiedParser:
             return matches[0].replace(".", ":", 1), matches[1].replace(".", ":", 1)
         return "", ""
 
-    def _parse_page1_dates_ocr(self, pdf):
-        if not pdf.pages:
+    def _parse_page1_dates_ocr(self, pdf, page_idx: int = 0):
+        if not pdf.pages or page_idx >= len(pdf.pages):
             return "", ""
         try:
             import pytesseract
@@ -1969,7 +2118,7 @@ class FinalUnifiedParser:
             return "", ""
         if not self._configure_tesseract(pytesseract):
             return "", ""
-        page = pdf.pages[0]
+        page = pdf.pages[page_idx]
         h = page.height
         w = page.width
         crops = [
