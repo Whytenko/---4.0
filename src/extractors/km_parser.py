@@ -24,12 +24,30 @@ def parse_field(text: str) -> str:
     return match.group(1) if match else ""
 
 def parse_bush(text: str) -> str:
-    match = re.search(r'Куст[^0-9]*([0-9]+)', text)
+    # Формат "Номер скважины / куст ... 622 / 27" проверяем ПЕРВЫМ и
+    # регистро-независимо: номер скважины может иметь буквенный суффикс
+    # ("1996Л"), поэтому между цифрами и "/" не обязательно сразу пробел/слэш.
+    # Куст тоже может иметь буквенный суффикс ("115Б") — это отдельный
+    # "Вид куста" в справочнике по километражу (см. split_bush), и без
+    # него сверка может взять не ту строку справочника (разные расстояния
+    # для "115" и "115 Б").
+    match = re.search(r'скважины\s*/\s*куст[^0-9]*\d+[^/]*/\s*([0-9]+[А-Яа-я]?)', text, re.IGNORECASE)
     if match:
         return match.group(1)
-    # формат "Номер скважины / куст ... 622 / 27"
-    match = re.search(r'скважины\s*/\s*куст[^0-9]*\d+\s*/\s*([0-9]+)', text, re.IGNORECASE)
+    # Отдельная строка вида "Куст: 29" (без привязки к номеру скважины) —
+    # регистрозависимо, иначе ложно совпадает с "куст" внутри "Номер
+    # скважины / куст......." и захватывает номер скважины вместо куста.
+    match = re.search(r'Куст[^0-9]*([0-9]+[А-Яа-я]?)', text)
     return match.group(1) if match else ""
+
+
+def split_bush(bush: str) -> tuple:
+    """Разбивает куст на числовую часть и буквенный 'Вид куста'
+    ('115Б' -> ('115', 'Б'), '446' -> ('446', ''))."""
+    match = re.match(r'([0-9]+)([А-Яа-я]?)', bush or "")
+    if not match:
+        return bush or "", ""
+    return match.group(1), match.group(2)
 
 def _nth_number(line: str, n: int):
     nums = re.findall(r'\d+[.,]?\d*', line)
@@ -40,6 +58,7 @@ def _nth_number(line: str, n: int):
 def parse_relocation_values(text: str):
     v1 = None
     v3 = None
+    voff = None
     for line in text.split('\n'):
         if 'Переезд перфораторной партии' not in line and 'Переезд комп.партии' not in line and 'Переезд комп. партии' not in line:
             continue
@@ -49,31 +68,59 @@ def parse_relocation_values(text: str):
         if re.search(r'переезд .*3\s*гр', line, re.IGNORECASE) and v3 is None:
             m = re.search(r'0,0\s+0,0\s+([0-9]+[.,]?[0-9]*)', line)
             v3 = _parse_float(m.group(1)) if m else _nth_number(line, 5)
-    # Fallback: search near "1 гр" and "3 гр"
+        if re.search(r'переезд .*бездорож', line, re.IGNORECASE) and voff is None:
+            m = re.search(r'0,0\s+0,0\s+([0-9]+[.,]?[0-9]*)', line)
+            voff = _parse_float(m.group(1)) if m else _nth_number(line, 5)
+    # Fallback: search near "1 гр", "3 гр" и "бездорожье"
     if v1 is None:
         match1 = re.search(r'Переезд перфораторной партии.*?1\s*гр[^0-9]*([0-9]+[.,]?[0-9]*)', text, re.IGNORECASE | re.DOTALL)
         v1 = _parse_float(match1.group(1)) if match1 else None
     if v3 is None:
         match3 = re.search(r'Переезд перфораторной партии.*?3\s*гр[^0-9]*([0-9]+[.,]?[0-9]*)', text, re.IGNORECASE | re.DOTALL)
         v3 = _parse_float(match3.group(1)) if match3 else None
-    return v1, v3
+    if voff is None:
+        match_off = re.search(r'Переезд перфораторной партии.*?бездорож[^0-9]*([0-9]+[.,]?[0-9]*)', text, re.IGNORECASE | re.DOTALL)
+        voff = _parse_float(match_off.group(1)) if match_off else None
+    return v1, v3, voff
 
 def get_report_values(field: str, bush: str):
     excel_path = get_reference_dir() / "17. Отчет по километражу.xlsx"
     if not excel_path.exists():
-        return None, None
+        return None, None, None
+    bush_number, bush_type = split_bush(bush)
     df = pd.read_excel(excel_path, sheet_name="Sheet1", header=None)
+    fallback_row = None
     for i in range(2, df.shape[0]):
         f = str(df.iloc[i, 0]).strip()
         b = str(df.iloc[i, 1]).strip()
         if not f or f == "nan":
             continue
-        if field.lower() in f.lower() and b == str(bush):
-            # столбцы "Проезд, 1 категории" и "Проезд, 3 категории" (1-based: 4 и 5)
-            v1 = _parse_float(df.iloc[i, 3])
-            v3 = _parse_float(df.iloc[i, 4])
-            return v1, v3
-    return None, None
+        if field.lower() not in f.lower() or b != bush_number:
+            continue
+        # "Вид куста" (столбец C, 0-based индекс 2) различает несколько
+        # маршрутов для ОДНОГО номера куста ("115" и "115 Б" — разные
+        # расстояния) — без учёта вида сверка может взять не ту строку.
+        row_type = str(df.iloc[i, 2] or "").strip()
+        if row_type.lower() == (bush_type or "").lower():
+            row = df.iloc[i]
+        elif fallback_row is None:
+            fallback_row = df.iloc[i]
+            continue
+        else:
+            continue
+        # столбцы (1-based): D=4 "Проезд, 1 категории", E=5 "Проезд, 3
+        # категории", F=6 "Проезд бездорожье" (0-based: 3, 4, 5)
+        v1 = _parse_float(row.iloc[3])
+        v3 = _parse_float(row.iloc[4])
+        voff = _parse_float(row.iloc[5])
+        return v1, v3, voff
+    if fallback_row is not None:
+        return (
+            _parse_float(fallback_row.iloc[3]),
+            _parse_float(fallback_row.iloc[4]),
+            _parse_float(fallback_row.iloc[5]),
+        )
+    return None, None, None
 
 def _has_relocation_note(pdf) -> bool:
     """На 2 листе иногда стоит пометка 'Приезд на базу (переезд на другой
@@ -96,15 +143,17 @@ def compute_km_report(pdf_path: Path) -> dict:
         relocation_note = _has_relocation_note(pdf)
     field = parse_field(text)
     bush = parse_bush(text)
-    v1, v3 = parse_relocation_values(text)
+    v1, v3, voff = parse_relocation_values(text)
     field, bush, v1, v3, ml_used = _apply_ml_overrides(pdf_path, field, bush, v1, v3)
-    r1, r3 = get_report_values(field, bush) if field and bush else (None, None)
+    r1, r3, roff = get_report_values(field, bush) if field and bush else (None, None, None)
 
     # Справочник хранит расстояние в одну сторону; в акте фиксируется туда+обратно
     if r1 is not None:
         r1 = r1 * 2
     if r3 is not None:
         r3 = r3 * 2
+    if roff is not None:
+        roff = roff * 2
 
     def _compare(actual, expected):
         if actual is None or expected is None:
@@ -119,12 +168,14 @@ def compute_km_report(pdf_path: Path) -> dict:
 
     result1 = _compare(v1, r1)
     result3 = _compare(v3, r3)
+    result_off = _compare(voff, roff)
+    results = (result1, result3, result_off)
 
-    if result1 is None and result3 is None:
+    if all(r is None for r in results):
         overall = "neutral"
-    elif result1 == "bad" or result3 == "bad":
+    elif any(r == "bad" for r in results):
         overall = "bad"
-    elif result1 == "conditional_ok" or result3 == "conditional_ok":
+    elif any(r == "conditional_ok" for r in results):
         overall = "conditional_ok"
     else:
         overall = "ok"
@@ -134,10 +185,13 @@ def compute_km_report(pdf_path: Path) -> dict:
         "bush": bush,
         "v1": v1,
         "v3": v3,
+        "voff": voff,
         "r1": r1,
         "r3": r3,
+        "roff": roff,
         "result1": result1,
         "result3": result3,
+        "result_off": result_off,
         "relocation_note": relocation_note,
     }
 
@@ -149,8 +203,10 @@ def process_pdf(pdf_path: Path):
     print(f"Куст: {result['bush'] if result['bush'] else 'не найден'}")
     print(f"Переезд 1 гр.: {result['v1'] if result['v1'] is not None else 'не найдено'}")
     print(f"Переезд 3 гр.: {result['v3'] if result['v3'] is not None else 'не найдено'}")
+    print(f"Переезд бездорожье: {result['voff'] if result['voff'] is not None else 'не найдено'}")
     print(f"По отчету 1 гр.: {result['r1'] if result['r1'] is not None else 'не найдено'}")
     print(f"По отчету 3 гр.: {result['r3'] if result['r3'] is not None else 'не найдено'}")
+    print(f"По отчету бездорожье: {result['roff'] if result['roff'] is not None else 'не найдено'}")
 
     def _format_result(label: str, result_status) -> None:
         if result_status is None:
@@ -164,6 +220,7 @@ def process_pdf(pdf_path: Path):
 
     _format_result("1 гр.", result["result1"])
     _format_result("3 гр.", result["result3"])
+    _format_result("бездорожье", result["result_off"])
 
 def _apply_ml_overrides(pdf_path: Path, field: str, bush: str, v1, v3):
     try:
