@@ -756,9 +756,90 @@ html = """
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
+
+        .splash {
+            position: fixed;
+            inset: 0;
+            z-index: 999;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background:
+                radial-gradient(1100px 700px at 50% -10%, rgba(227, 6, 19, 0.35), transparent 60%),
+                linear-gradient(155deg, #1a0002 0%, #3d0308 22%, #7a0812 42%, #b8101c 58%, #7a0812 74%, #1a0002 100%);
+            background-size: 200% 200%;
+            animation: splashGradient 6s ease-in-out infinite;
+            transition: opacity 0.5s ease, visibility 0.5s ease;
+        }
+        .splash.hidden {
+            opacity: 0;
+            visibility: hidden;
+            pointer-events: none;
+        }
+        @keyframes splashGradient {
+            0% { background-position: 0% 30%; }
+            50% { background-position: 100% 70%; }
+            100% { background-position: 0% 30%; }
+        }
+        .splash-logo-wrap {
+            background: #fff;
+            border-radius: 22px;
+            padding: 22px 34px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+            animation: splashPulse 2.2s ease-in-out infinite;
+        }
+        .splash-logo-wrap img {
+            width: 220px;
+            height: auto;
+            display: block;
+        }
+        @keyframes splashPulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.035); }
+        }
+        .splash-title {
+            margin-top: 28px;
+            color: #fff;
+            font-weight: 700;
+            font-size: 22px;
+            letter-spacing: 1px;
+            text-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+        }
+        .splash-subtitle {
+            margin-top: 8px;
+            color: rgba(255, 255, 255, 0.75);
+            font-size: 13px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+        }
+        .splash-spinner {
+            margin-top: 34px;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            border: 3px solid rgba(255, 255, 255, 0.25);
+            border-top-color: #fff;
+            animation: spin 0.9s linear infinite;
+        }
+        .splash-dots {
+            margin-top: 14px;
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 12px;
+            letter-spacing: 0.5px;
+        }
     </style>
 </head>
 <body>
+    <div class="splash" id="splashScreen">
+        <div class="splash-logo-wrap">
+            <img src="__SVG_LOGO__" alt="ЛУКОЙЛ">
+        </div>
+        <div class="splash-title">AKT-NARYAD VERIFIER</div>
+        <div class="splash-subtitle">Система анализа актов-нарядов</div>
+        <div class="splash-spinner"></div>
+        <div class="splash-dots" id="splashStatus">Загрузка...</div>
+    </div>
     <div class="app">
         <aside class="sidebar">
             <div class="sidebar-header">
@@ -1384,8 +1465,17 @@ html = """
             clearHintLoading();
         }
         
+        function hideSplash() {
+            const splash = document.getElementById('splashScreen');
+            if (splash) splash.classList.add('hidden');
+        }
+
         // Загружаем файлы при старте
-        function initApp() {
+        async function initApp() {
+            const splashStart = Date.now();
+            const splashStatus = document.getElementById('splashStatus');
+            const setSplashStatus = (text) => { if (splashStatus) splashStatus.textContent = text; };
+
             try {
                 if (requests.length === 0) {
                     createNewRequest();
@@ -1393,8 +1483,9 @@ html = """
                     renderRequestList();
                     renderOutput();
                 }
-                refreshFiles();
                 bindHints();
+                setSplashStatus('Проверка файлов...');
+                await refreshFiles();
                 setTimeout(() => {
                     if (requests.length === 0) {
                         createNewRequest();
@@ -1402,6 +1493,11 @@ html = """
                 }, 50);
             } catch (e) {
                 console.error(e);
+            } finally {
+                setSplashStatus('Готово');
+                // Держим экран минимум ~900мс, чтобы не мигал на быстром старте
+                const elapsed = Date.now() - splashStart;
+                setTimeout(hideSplash, Math.max(0, 900 - elapsed));
             }
         }
 

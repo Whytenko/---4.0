@@ -94,6 +94,57 @@ class WellData:
         except:
             return 0.0
     
+    # Единый реестр проверок: (ключ, геттер результата, подпись по умолчанию,
+    # молчать ли при статусе "neutral"). И print_with_units(), и
+    # get_check_summary() идут по одному и тому же списку — раньше это были
+    # два независимых места, которые несколько раз забывали синхронизировать
+    # при добавлении новой проверки.
+    #
+    # Каждый геттер возвращает dict вида:
+    #   {"status": "ok"|"bad"|"neutral"|"conditional_ok",
+    #    "label": <необязательная замена подписи>,
+    #    "value_text": <необязательный текст вместо иконки по умолчанию>,
+    #    "details": [<уже полностью отформатированные строки, с отступом>]}
+    _CHECK_REGISTRY_BEFORE_ML: ClassVar[tuple] = (
+        ("spo", lambda self: self._check_volume_spo(), "Отчет по СПО", False),
+        ("vm_cost", lambda self: self._check_vm_cost(), "Цена ВМ", False),
+        ("rate", lambda self: self._check_rate(), "Проверка расценок", False),
+        ("volume_qty", lambda self: self._check_volume_qty(),
+         "Сравнение объемов (стр.1) и кол-ва (стр.3)", False),
+        ("page2_dates", lambda self: self._check_page2_dates(), "Сравнение дат (стр.2)", False),
+    )
+    _CHECK_REGISTRY_AFTER_ML: ClassVar[tuple] = (
+        ("integral", lambda self: self._check_integral(), "Интегральный коэффициент", False),
+        ("contract_coeff", lambda self: self._check_contract_coefficient(),
+         "Коэффициент по договору", False),
+        ("barometry_task53", lambda self: self.check_results.get("barometry_task53", {"status": "neutral"}),
+         "Барометрия при задаче №53", True),
+        ("tech_duty", lambda self: self._prefix_details(self.check_results.get("tech_duty", {"status": "neutral"})),
+         "Тех.дежурство >4ч (нужен акт)", True),
+        ("thermometry_overlap",
+         lambda self: self._prefix_details(self.check_results.get("thermometry_overlap", {"status": "neutral"})),
+         "Термометрия 200/500 (пересечение)", True),
+        ("zayavka", lambda self: self._check_zayavka(), "Сверка с заявкой", True),
+    )
+
+    _STATUS_ICONS: ClassVar[dict] = {"ok": "✅", "bad": "❌"}
+
+    def _print_check(self, getter, default_label: str, silent_on_neutral: bool) -> None:
+        result = getter(self)
+        status = result.get("status", "neutral")
+        if status == "neutral" and silent_on_neutral:
+            return
+        label = result.get("label", default_label)
+        if "value_text" in result:
+            value_text = result["value_text"]
+        elif status == "neutral":
+            value_text = "данных нет"
+        else:
+            value_text = self._STATUS_ICONS.get(status, status)
+        print(f"  {label}: {value_text}")
+        for line in result.get("details", []):
+            print(line)
+
     def print_with_units(self):
         """Вывод с единицами измерения"""
         print(f"\n{self.filename}:")
@@ -109,31 +160,15 @@ class WellData:
         print(f"  Продолжительность работ: {self.duration_hours:.2f} часов")
         if self.task_number:
             print(f"  Номер задачи: {self.task_number}")
-        self._print_volume_spo_check()
-        self._print_vm_cost_check()
-        self._print_rate_check()
-        self._print_volume_qty_check()
-        self._print_page2_dates_check()
+        for _key, getter, label, silent in self._CHECK_REGISTRY_BEFORE_ML:
+            self._print_check(getter, label, silent)
         self._print_ml_info()
-        self._print_integral_check()
-        self._print_contract_coefficient_check()
-        self._print_barometry_task53_check()
-        self._print_tech_duty_check()
-        self._print_thermometry_overlap_check()
-        self._print_zayavka_check()
+        for _key, getter, label, silent in self._CHECK_REGISTRY_AFTER_ML:
+            self._print_check(getter, label, silent)
 
-    def _print_rate_check(self):
-        status = self.rate_check_status
-        if status == "ok":
-            print("  Проверка расценок: ✅")
-        elif status == "bad":
-            print("  Проверка расценок: ❌")
-        else:
-            print("  Проверка расценок: данных нет")
-            return
-
-        for line in self.rate_check_details:
-            print(f"    {line}")
+    def _check_rate(self) -> dict:
+        status = self.rate_check_status or "neutral"
+        return {"status": status, "details": [f"    {line}" for line in self.rate_check_details]}
 
     def _to_float(self, value: str) -> float | None:
         try:
@@ -167,17 +202,13 @@ class WellData:
             return int(math.ceil(value - 0.5))
 
         match = _round_half_up(spo_act) == _round_half_up(spo_table)
-        return {"status": "ok" if match else "bad", "spo_act": spo_act, "spo_table": spo_table}
-
-    def _print_volume_spo_check(self):
-        result = self._check_volume_spo()
-        if result["status"] == "neutral":
-            print("  Отчет по СПО: данных нет")
-            return
-        status = "✅" if result["status"] == "ok" else "❌"
-        print(f"  Отчет по СПО: {status}")
-        print(f"    СПО в акте = {result['spo_act']:.2f}")
-        print(f"    СПО в таблице = {result['spo_table']:.2f}")
+        return {
+            "status": "ok" if match else "bad",
+            "details": [
+                f"    СПО в акте = {spo_act:.2f}",
+                f"    СПО в таблице = {spo_table:.2f}",
+            ],
+        }
 
     def _check_vm_cost(self) -> dict:
         task = self.vm_task
@@ -196,52 +227,32 @@ class WellData:
                 unit_price = unit_price / count
 
         if not task or unit_price is None:
-            return {"status": "neutral", "reason": "no_data"}
+            return {"status": "neutral", "label": "Стоимость ВМ", "value_text": "данных нет"}
 
         max_price, min_price = self._get_vm_prices(task, unit_price)
         if max_price is None and min_price is None:
-            return {"status": "neutral", "reason": "not_in_table"}
+            return {"status": "neutral", "label": "Стоимость ВМ", "value_text": "не найдено в таблице"}
 
         price_ok = min_price is not None and math.isclose(unit_price, min_price, rel_tol=0.0, abs_tol=0.1)
 
-        count_status = None
+        details: List[str] = []
+        if price_raw is not None:
+            details.append(f"    Цена в акте = {self._format_ru(price_raw)}")
+        if count is not None:
+            details.append(f"    Кол-во = {int(count)}")
+        if total is not None:
+            details.append(f"    Итого = {self._format_ru(total)}")
         if table_count is not None:
             count_match = math.isclose(count, table_count, rel_tol=0.0, abs_tol=0.1) if count is not None else False
-            count_status = "ok" if count_match else "bad"
+            count_icon = "✅" if count_match else "❌"
+            details.append(f"    Сравнение кол-ва: {count_icon}")
+            details.append(f"      Кол-во в таблице = {int(table_count)}")
+        if max_price is not None:
+            details.append(f"    Стоимость 1 отв. при max плотности = {self._format_ru(max_price)}")
+        if min_price is not None:
+            details.append(f"    Стоимость 1 отв. при min плотности = {self._format_ru(min_price)}")
 
-        return {
-            "status": "ok" if price_ok else "bad",
-            "price_raw": price_raw,
-            "count": count,
-            "total": total,
-            "table_count": table_count,
-            "max_price": max_price,
-            "min_price": min_price,
-            "count_status": count_status,
-        }
-
-    def _print_vm_cost_check(self):
-        result = self._check_vm_cost()
-        if result["status"] == "neutral":
-            label = "не найдено в таблице" if result.get("reason") == "not_in_table" else "данных нет"
-            print(f"  Стоимость ВМ: {label}")
-            return
-        status = "✅" if result["status"] == "ok" else "❌"
-        print(f"  Цена ВМ: {status}")
-        if result["price_raw"] is not None:
-            print(f"    Цена в акте = {self._format_ru(result['price_raw'])}")
-        if result["count"] is not None:
-            print(f"    Кол-во = {int(result['count'])}")
-        if result["total"] is not None:
-            print(f"    Итого = {self._format_ru(result['total'])}")
-        if result["table_count"] is not None:
-            count_status = "✅" if result["count_status"] == "ok" else "❌"
-            print(f"    Сравнение кол-ва: {count_status}")
-            print(f"      Кол-во в таблице = {int(result['table_count'])}")
-        if result["max_price"] is not None:
-            print(f"    Стоимость 1 отв. при max плотности = {self._format_ru(result['max_price'])}")
-        if result["min_price"] is not None:
-            print(f"    Стоимость 1 отв. при min плотности = {self._format_ru(result['min_price'])}")
+        return {"status": "ok" if price_ok else "bad", "label": "Цена ВМ", "details": details}
 
     def _check_volume_qty(self) -> dict:
         vol_sum = self._to_float(self.volume_sum_page1)
@@ -249,17 +260,13 @@ class WellData:
         if vol_sum is None or qty_sum is None:
             return {"status": "neutral"}
         match = math.isclose(vol_sum, qty_sum, rel_tol=0.0, abs_tol=0.1)
-        return {"status": "ok" if match else "bad", "vol_sum": vol_sum, "qty_sum": qty_sum}
-
-    def _print_volume_qty_check(self):
-        result = self._check_volume_qty()
-        if result["status"] == "neutral":
-            print("  Сравнение объемов (стр.1) и кол-ва (стр.3): данных нет")
-            return
-        status = "✅" if result["status"] == "ok" else "❌"
-        print(f"  Сравнение объемов (стр.1) и кол-ва (стр.3): {status}")
-        print(f"    Сумма объемов (стр.1) = {result['vol_sum']:.2f}")
-        print(f"    Сумма кол-ва (стр.3) = {result['qty_sum']:.2f}")
+        return {
+            "status": "ok" if match else "bad",
+            "details": [
+                f"    Сумма объемов (стр.1) = {vol_sum:.2f}",
+                f"    Сумма кол-ва (стр.3) = {qty_sum:.2f}",
+            ],
+        }
 
     def _check_page2_dates(self) -> dict:
         start1 = self.start_date
@@ -267,79 +274,55 @@ class WellData:
         start2 = self.page2_start
         end2 = self.page2_end
         if not start2 or not end2 or "не найдено" in (start2, end2):
-            return {"status": "conditional_ok"}
+            return {"status": "conditional_ok", "value_text": "условно ✅"}
         match = (start1 == start2) and (end1 == end2)
         return {
             "status": "ok" if match else "bad",
-            "start1": start1,
-            "end1": end1,
-            "start2": start2,
-            "end2": end2,
+            "details": [
+                f"    Начало работ: {start1} / {start2}",
+                f"    Окончание работ: {end1} / {end2}",
+            ],
         }
-
-    def _print_page2_dates_check(self):
-        result = self._check_page2_dates()
-        if result["status"] == "conditional_ok":
-            print("  Сравнение дат (стр.2): условно ✅")
-            return
-        status = "✅" if result["status"] == "ok" else "❌"
-        print(f"  Сравнение дат (стр.2): {status}")
-        print(f"    Начало работ: {result['start1']} / {result['start2']}")
-        print(f"    Окончание работ: {result['end1']} / {result['end2']}")
 
     def _check_integral(self) -> dict:
         if not self.integral_row_status:
             return {"status": "neutral"}
-        return {"status": self.integral_row_status, "details": self.integral_row_details}
-
-    def _print_integral_check(self):
-        result = self._check_integral()
-        if result["status"] == "neutral":
-            print("  Интегральный коэффициент: данных нет")
-            return
-        status = "✅" if result["status"] == "ok" else "❌"
-        print(f"  Интегральный коэффициент: {status}")
-        for line in result.get("details", []):
-            print(f"    {line}")
+        return {
+            "status": self.integral_row_status,
+            "details": [f"    {line}" for line in self.integral_row_details],
+        }
 
     def _check_contract_coefficient(self) -> dict:
         expected = CONTRACT_COEFFICIENTS.get(self.contract_number)
         if not self.contract_number or expected is None:
             return {"status": "neutral"}
         if self.contract_coeff_value is None:
-            return {"status": "neutral", "expected": expected}
+            return {"status": "neutral"}
         match = math.isclose(self.contract_coeff_value, expected, rel_tol=0.0, abs_tol=0.01)
         return {
             "status": "ok" if match else "bad",
-            "expected": expected,
-            "actual": self.contract_coeff_value,
+            "details": [
+                f"    Договор №{self.contract_number}: ожидается {expected:.3f}, "
+                f"в акте {self.contract_coeff_value:.3f}"
+            ],
         }
-
-    def _print_contract_coefficient_check(self):
-        result = self._check_contract_coefficient()
-        if result["status"] == "neutral":
-            print("  Коэффициент по договору: данных нет")
-            return
-        status = "✅" if result["status"] == "ok" else "❌"
-        print(f"  Коэффициент по договору: {status}")
-        print(
-            f"    Договор №{self.contract_number}: ожидается {result['expected']:.3f}, "
-            f"в акте {result['actual']:.3f}"
-        )
 
     def _check_zayavka(self) -> dict:
         if not self.zayavka_check_status:
             return {"status": "neutral"}
-        return {"status": self.zayavka_check_status, "details": self.zayavka_check_details}
+        return {
+            "status": self.zayavka_check_status,
+            "details": [f"    {line}" for line in self.zayavka_check_details],
+        }
 
-    def _print_zayavka_check(self):
-        result = self._check_zayavka()
-        if result["status"] == "neutral":
-            return
-        status = "✅" if result["status"] == "ok" else "❌"
-        print(f"  Сверка с заявкой: {status}")
-        for line in result.get("details", []):
-            print(f"    {line}")
+    @staticmethod
+    def _prefix_details(result: dict) -> dict:
+        """Строки в check_results (барометрия/тех.дежурство/термометрия)
+        хранятся без отступа — добавляем его только для единого принтера,
+        не трогая исходно сохранённый dict."""
+        if not result.get("details"):
+            return result
+        return {**result, "details": [f"    {line}" for line in result["details"]]}
 
     def _check_barometry_task53(self, rows: List[dict]) -> dict:
         task = str(self.task_number or "").strip()
@@ -347,13 +330,6 @@ class WellData:
             return {"status": "neutral"}
         found = any("барометр" in str(row.get("name", "")).lower() for row in rows)
         return {"status": "ok" if found else "bad"}
-
-    def _print_barometry_task53_check(self):
-        result = self.check_results.get("barometry_task53", {"status": "neutral"})
-        if result["status"] == "neutral":
-            return
-        status = "✅" if result["status"] == "ok" else "❌"
-        print(f"  Барометрия при задаче №53: {status}")
 
     def _check_tech_duty_hours(self, rows: List[dict]) -> dict:
         threshold_hours = 4.0
@@ -378,15 +354,6 @@ class WellData:
         if flagged:
             return {"status": "bad", "details": flagged}
         return {"status": "ok", "details": [f"В норме (≤{threshold_hours:.0f} ч), строк проверено: {checked}"]}
-
-    def _print_tech_duty_check(self):
-        result = self.check_results.get("tech_duty", {"status": "neutral"})
-        if result["status"] == "neutral":
-            return
-        status = "✅" if result["status"] == "ok" else "❌"
-        print(f"  Тех.дежурство >4ч (нужен акт): {status}")
-        for line in result.get("details", []):
-            print(f"    {line}")
 
     def _check_thermometry_overlap(self, rows: List[dict]) -> dict:
         scale_re = re.compile(r'термометри.*?[MМ]\s*1\s*:\s*(200|500)', re.IGNORECASE)
@@ -425,31 +392,15 @@ class WellData:
             "details": [f"Пересечений не найдено (М1:200: {len(intervals_200)}, М1:500: {len(intervals_500)})"],
         }
 
-    def _print_thermometry_overlap_check(self):
-        result = self.check_results.get("thermometry_overlap", {"status": "neutral"})
-        if result["status"] == "neutral":
-            return
-        status = "✅" if result["status"] == "ok" else "❌"
-        print(f"  Термометрия 200/500 (пересечение): {status}")
-        for line in result.get("details", []):
-            print(f"    {line}")
-
     def get_check_summary(self) -> dict:
         """Структурированные статусы всех проверок (ok/bad/neutral/conditional_ok)
-        без печати — используется для выгрузки пакетного Excel-отчёта."""
-        return {
-            "spo": self._check_volume_spo(),
-            "vm_cost": self._check_vm_cost(),
-            "rate": {"status": self.rate_check_status or "neutral"},
-            "volume_qty": self._check_volume_qty(),
-            "page2_dates": self._check_page2_dates(),
-            "integral": self._check_integral(),
-            "contract_coeff": self._check_contract_coefficient(),
-            "barometry_task53": self.check_results.get("barometry_task53", {"status": "neutral"}),
-            "tech_duty": self.check_results.get("tech_duty", {"status": "neutral"}),
-            "thermometry_overlap": self.check_results.get("thermometry_overlap", {"status": "neutral"}),
-            "zayavka": self._check_zayavka(),
-        }
+        без печати — используется для выгрузки пакетного Excel-отчёта. Идёт
+        по тому же реестру _CHECK_REGISTRY_*, что и print_with_units(), —
+        поэтому эти два места больше не могут разойтись."""
+        summary = {}
+        for key, getter, _label, _silent in self._CHECK_REGISTRY_BEFORE_ML + self._CHECK_REGISTRY_AFTER_ML:
+            summary[key] = getter(self)
+        return summary
 
     def _print_ml_info(self):
         if not self.ml_applied:
@@ -610,6 +561,8 @@ class FinalUnifiedParser:
                 return well_data
                 
         except Exception:
+            if os.environ.get("AKT_DEBUG_PARSE_ERRORS") == "1":
+                traceback.print_exc()
             return self._get_error_result(pdf_path)
 
     def _normalize_for_match(self, value: object) -> str:
