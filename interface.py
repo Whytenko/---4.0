@@ -1497,7 +1497,7 @@ html = """
                 setSplashStatus('Готово');
                 // Держим экран минимум ~900мс, чтобы не мигал на быстром старте
                 const elapsed = Date.now() - splashStart;
-                setTimeout(hideSplash, Math.max(0, 900 - elapsed));
+                setTimeout(hideSplash, Math.max(0, 3000 - elapsed));
             }
         }
 
