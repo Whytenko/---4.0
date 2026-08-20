@@ -13,24 +13,37 @@ import pdfplumber
 # как это уже было).
 
 
-def classify_text(text: str) -> str:
-    """Определяет тип документа по тексту 1 страницы: 'zayavka' | 'akt_prostoy'
-    | 'akt_naryad'. Вынесено отдельно от classify_pdf(), чтобы логику
-    классификации можно было тестировать без реального PDF-файла."""
+def classify_text_with_reason(text: str) -> tuple[str, str]:
+    """Определяет тип документа по тексту 1 страницы и ПОЧЕМУ — какой
+    именно маркер сработал. Единый источник истины для classify_text()
+    (кратко) и для аудиторского следа в пакетном выводе (batch_pipeline),
+    чтобы будущее ложное срабатывание (как с "пространстве" → "прост")
+    было видно в обычном выводе, а не требовало отдельного debug-скрипта."""
     text = text or ""
     stripped = text.strip()
     upper = stripped.upper()
 
-    if upper.startswith("ЗАЯВКА") or re.search(r'ЗАЯВКА\s*№', upper):
-        return "zayavka"
+    if upper.startswith("ЗАЯВКА"):
+        return "zayavka", "текст начинается с 'ЗАЯВКА'"
+    if re.search(r'ЗАЯВКА\s*№', upper):
+        return "zayavka", "найдено 'ЗАЯВКА №'"
 
     # Требуем целую фразу "акт на простой", а не совпадение отдельных
     # обрывков слов — иначе ложно срабатывает на словах вроде "пространстве"
     # (подстрока "прост"), которые обычны в обычных актах-нарядах.
-    if re.search(r'акт\s+на\s+прост', upper, re.IGNORECASE):
-        return "akt_prostoy"
+    match = re.search(r'акт\s+на\s+прост', upper, re.IGNORECASE)
+    if match:
+        return "akt_prostoy", f"найдена фраза «{match.group(0)}»"
 
-    return "akt_naryad"
+    return "akt_naryad", "по умолчанию (не заявка и не акт на простой)"
+
+
+def classify_text(text: str) -> str:
+    """Определяет тип документа по тексту 1 страницы: 'zayavka' | 'akt_prostoy'
+    | 'akt_naryad'. Вынесено отдельно от classify_pdf(), чтобы логику
+    классификации можно было тестировать без реального PDF-файла."""
+    kind, _reason = classify_text_with_reason(text)
+    return kind
 
 
 def classify_pdf(pdf_path: Path) -> tuple[str, str]:
@@ -43,6 +56,20 @@ def classify_pdf(pdf_path: Path) -> tuple[str, str]:
 
     text = text or ""
     return classify_text(text), text
+
+
+def classify_pdf_with_reason(pdf_path: Path) -> tuple[str, str, str]:
+    """Как classify_pdf(), но дополнительно возвращает причину решения —
+    для аудиторского следа в пакетном выводе."""
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            text = pdf.pages[0].extract_text() if pdf.pages else ""
+    except Exception:
+        return "akt_naryad", "не удалось открыть/прочитать PDF — считаем актом-нарядом по умолчанию", ""
+
+    text = text or ""
+    kind, reason = classify_text_with_reason(text)
+    return kind, reason, text
 
 
 def parse_zayavka_text(text: str) -> dict:

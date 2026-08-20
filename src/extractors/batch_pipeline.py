@@ -26,6 +26,10 @@ class BatchResult:
     report_path: Optional[Path] = None
     stdout_text: str = ""
     stderr_text: str = ""
+    # (имя файла, тип, причина) для каждого файла пакета — аудиторский след
+    # классификации, чтобы будущее ложное срабатывание было видно в обычном
+    # выводе, а не требовало отдельного debug-скрипта.
+    classifications: List[tuple] = field(default_factory=list)
 
 
 def run_batch_pipeline(pdf_paths: List[Path]) -> BatchResult:
@@ -39,7 +43,7 @@ def run_batch_pipeline(pdf_paths: List[Path]) -> BatchResult:
     try:
         from src.extractors.main_parser import PDFProcessor
         from src.extractors.doc_linking import (
-            classify_pdf,
+            classify_pdf_with_reason,
             parse_zayavka_text,
             apply_zayavka_checks,
         )
@@ -50,7 +54,8 @@ def run_batch_pipeline(pdf_paths: List[Path]) -> BatchResult:
         # с тех.дежурством не реализована), всё остальное обрабатывается
         # как акт-наряд, как и раньше.
         for path in pdf_paths:
-            kind, text = classify_pdf(path)
+            kind, reason, text = classify_pdf_with_reason(path)
+            result.classifications.append((path.name, kind, reason))
             if kind == "zayavka":
                 record = parse_zayavka_text(text)
                 record["filename"] = path.name
@@ -59,6 +64,11 @@ def run_batch_pipeline(pdf_paths: List[Path]) -> BatchResult:
                 result.prostoy_files.append(path.name)
             else:
                 result.akt_paths.append(path)
+
+        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+            print("Классификация пакета:")
+            for filename, kind, reason in result.classifications:
+                print(f"  [{kind}] {filename} — {reason}")
 
         processor = PDFProcessor()
         with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
