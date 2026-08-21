@@ -13,12 +13,13 @@ import shutil
 import ctypes
 import time
 import io
+import json
 import importlib
 import traceback
 from contextlib import redirect_stdout, redirect_stderr
 from urllib.parse import quote
 
-from src.utils.app_paths import ensure_runtime_layout, get_input_dir, get_runtime_root
+from src.utils.app_paths import ensure_runtime_layout, get_input_dir, get_reference_dir, get_runtime_root
 from src.utils.healthcheck import format_self_check_report, run_self_check
 from src.utils.smoke_test import format_smoke_report, run_smoke_test
 
@@ -176,6 +177,74 @@ class API:
         except Exception as e:
             return f"❌ Ошибка: {str(e)}"
 
+    # Справочники, которые оператору нужно регулярно обновлять целиком
+    # (присылают из другого отдела) — категория в модалке обновления
+    # копирует выбранный файл под точным именем, которое ищет код
+    # (main_parser.py / table_parser.py / km_parser.py), так что
+    # оператору не нужно знать и не нужно переименовывать файл руками.
+    REFERENCE_FILE_TARGETS = {
+        "temperature_current": ("Отчёт по температуре (текущий)", "20. Отчет по температуре.xlsx"),
+        "temperature_2026": ("Отчёт по температуре (2026)", "20. Отчет по температуре 2026.xlsx"),
+        "vm_cost": ("Стоимость ВМ задачи", "Стоимость ВМ задачи (не удалять).xlsx"),
+        "mileage": ("Отчёт по километражу", "17. Отчет по километражу.xlsx"),
+    }
+
+    def get_reference_update_categories(self):
+        return [{"key": key, "label": label} for key, (label, _target) in self.REFERENCE_FILE_TARGETS.items()]
+
+    def update_reference_file(self, category: str) -> str:
+        """Открывает диалог выбора файла и копирует его в reference_dir
+        под именем, которое ожидает код — чтобы обновление справочника
+        (температура, ВМ и т.д.) не требовало ручного переименования."""
+        target = self.REFERENCE_FILE_TARGETS.get(category)
+        if target is None:
+            return "❌ Неизвестная категория справочника"
+        label, filename = target
+
+        if self.window is None:
+            return "❌ Окно приложения не готово, попробуйте ещё раз"
+
+        try:
+            selected = self.window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=False,
+                file_types=("Excel файлы (*.xlsx)", "Все файлы (*.*)"),
+            )
+        except Exception as e:
+            return f"❌ Не удалось открыть диалог выбора файла: {e}"
+
+        if not selected:
+            return ""
+
+        src_path = Path(selected[0])
+        if not src_path.exists():
+            return "❌ Выбранный файл не найден"
+
+        dst_path = get_reference_dir() / filename
+        try:
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+        except Exception as e:
+            return f"❌ Не удалось обновить «{label}»: {e}"
+
+        self._clear_reference_caches()
+        return f"✅ «{label}» обновлён из файла {src_path.name}\nСохранено как: {dst_path}"
+
+    def _clear_reference_caches(self) -> None:
+        """Сбрасывает in-memory кэши справочников, чтобы обновлённый файл
+        подхватился сразу, без перезапуска приложения."""
+        try:
+            from src.extractors.main_parser import WellData
+            WellData._vm_price_df_cache = None
+        except Exception:
+            pass
+        try:
+            from src.extractors import table_parser
+            table_parser._SHEET_NAMES_CACHE.clear()
+            table_parser._SHEET_DF_CACHE.clear()
+        except Exception:
+            pass
+
     def pick_and_check_batch(self):
         """Открывает системный диалог выбора нескольких PDF, копирует их
         в input и сразу проверяет всем пакетом, выгружая сводный Excel-отчёт."""
@@ -218,7 +287,16 @@ class API:
         и открытие готового отчёта в системном приложении."""
         from src.extractors.batch_pipeline import run_batch_pipeline
 
-        result = run_batch_pipeline(pdf_paths)
+        def _on_progress(stage: str, current: int, total: int, filename: str) -> None:
+            if self.window is None:
+                return
+            payload = json.dumps({"stage": stage, "current": current, "total": total, "filename": filename})
+            try:
+                self.window.evaluate_js(f"window.updateBatchProgress && window.updateBatchProgress({payload})")
+            except Exception:
+                pass
+
+        result = run_batch_pipeline(pdf_paths, progress_callback=_on_progress)
 
         output = "🚀 ПАКЕТНАЯ ПРОВЕРКА\n"
         output += f"Файлов в пакете: {len(pdf_paths)} (актов: {len(result.akt_paths)}"
@@ -789,6 +867,81 @@ html = """
             font-size: 12px;
             letter-spacing: 0.5px;
         }
+
+        .batch-progress-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 900;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(20, 4, 6, 0.55);
+            backdrop-filter: blur(3px);
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.25s ease, visibility 0.25s ease;
+        }
+        .batch-progress-overlay.active {
+            opacity: 1;
+            visibility: visible;
+        }
+        .batch-progress-card {
+            background: var(--panel);
+            border-radius: 24px;
+            padding: 40px 50px;
+            box-shadow: 0 30px 80px rgba(0, 0, 0, 0.4);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-width: 260px;
+        }
+        .batch-progress-ring-wrap {
+            position: relative;
+            width: 160px;
+            height: 160px;
+        }
+        .batch-progress-ring-wrap svg {
+            transform: rotate(-90deg);
+        }
+        .batch-progress-ring-bg {
+            fill: none;
+            stroke: var(--border);
+            stroke-width: 10;
+        }
+        .batch-progress-ring-fg {
+            fill: none;
+            stroke: var(--accent);
+            stroke-width: 10;
+            stroke-linecap: round;
+            transition: stroke-dashoffset 0.35s ease;
+        }
+        .batch-progress-percent {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 32px;
+            font-weight: 700;
+            color: var(--text);
+        }
+        .batch-progress-stage {
+            margin-top: 24px;
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text);
+            letter-spacing: 0.3px;
+            text-align: center;
+        }
+        .batch-progress-filename {
+            margin-top: 6px;
+            font-size: 12px;
+            color: var(--muted);
+            max-width: 300px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
     </style>
 </head>
 <body>
@@ -800,6 +953,20 @@ html = """
         <div class="splash-subtitle">Система анализа актов-нарядов</div>
         <div class="splash-spinner"></div>
         <div class="splash-dots" id="splashStatus">Загрузка...</div>
+    </div>
+    <div class="batch-progress-overlay" id="batchProgressOverlay">
+        <div class="batch-progress-card">
+            <div class="batch-progress-ring-wrap">
+                <svg width="160" height="160" viewBox="0 0 160 160">
+                    <circle class="batch-progress-ring-bg" cx="80" cy="80" r="70"></circle>
+                    <circle class="batch-progress-ring-fg" id="batchProgressRing" cx="80" cy="80" r="70"
+                        stroke-dasharray="439.82" stroke-dashoffset="439.82"></circle>
+                </svg>
+                <div class="batch-progress-percent" id="batchProgressPercent">0%</div>
+            </div>
+            <div class="batch-progress-stage" id="batchProgressStage">Подготовка…</div>
+            <div class="batch-progress-filename" id="batchProgressFilename"></div>
+        </div>
     </div>
     <div class="app">
         <aside class="sidebar">
@@ -827,6 +994,9 @@ html = """
                     <button class="tool-btn" data-hint="Нажмите, чтобы открыть папку input" onclick="openFolder()" aria-label="Открыть папку">
                         <img src="__SVG_FOLDER__" class="icon-black" alt="">
                     </button>
+                    <button class="tool-btn" data-hint="Нажмите, чтобы обновить справочник (температура, ВМ, километраж)" onclick="openReferenceUpdateModal()" aria-label="Обновить справочник">
+                        <img src="__SVG_TABLE__" class="icon-black" alt="">
+                    </button>
                     <button class="tool-btn" data-hint="Нажмите, чтобы обновить список файлов" onclick="refreshFiles()" aria-label="Обновить">
                         <img src="__SVG_REFRESH__" alt="">
                     </button>
@@ -853,6 +1023,15 @@ html = """
                     <div class="modal-actions">
                         <button class="modal-btn" onclick="closeFileModal()">Отмена</button>
                         <button class="modal-btn primary" onclick="confirmFileModal()">Запустить</button>
+                    </div>
+                </div>
+            </div>
+            <div class="modal" id="referenceModal">
+                <div class="modal-card">
+                    <div class="modal-title">Что обновляем?</div>
+                    <div class="modal-list" id="referenceCategoryList"></div>
+                    <div class="modal-actions">
+                        <button class="modal-btn" onclick="closeReferenceModal()">Отмена</button>
                     </div>
                 </div>
             </div>
@@ -1290,15 +1469,57 @@ html = """
             refreshFiles();
         }
 
+        const BATCH_RING_CIRCUMFERENCE = 439.82;
+        const BATCH_STAGE_LABELS = {
+            classify: 'Классификация файлов',
+            parse: 'Разбор акт-нарядов',
+            report: 'Формирование отчёта',
+        };
+
+        function showBatchProgress() {
+            const overlay = document.getElementById('batchProgressOverlay');
+            if (!overlay) return;
+            setBatchProgressUI(0, 'Подготовка…', '');
+            overlay.classList.add('active');
+        }
+
+        function hideBatchProgress() {
+            const overlay = document.getElementById('batchProgressOverlay');
+            if (overlay) overlay.classList.remove('active');
+        }
+
+        function setBatchProgressUI(percent, stageText, filename) {
+            const ring = document.getElementById('batchProgressRing');
+            const percentEl = document.getElementById('batchProgressPercent');
+            const stageEl = document.getElementById('batchProgressStage');
+            const fileEl = document.getElementById('batchProgressFilename');
+            if (ring) {
+                ring.style.strokeDashoffset = String(BATCH_RING_CIRCUMFERENCE * (1 - percent / 100));
+            }
+            if (percentEl) percentEl.textContent = Math.round(percent) + '%';
+            if (stageEl) stageEl.textContent = stageText;
+            if (fileEl) fileEl.textContent = filename || '';
+        }
+
+        window.updateBatchProgress = function (data) {
+            const total = data.total || 1;
+            const current = data.current || 0;
+            const percent = Math.min(100, Math.round((current / total) * 100));
+            const label = BATCH_STAGE_LABELS[data.stage] || 'Обработка';
+            setBatchProgressUI(percent, `${label} (${current}/${total})`, data.filename || '');
+        };
+
         async function runBatchCheck() {
             setLoading(true);
             setHintLoading('Пакетная проверка');
+            showBatchProgress();
             let result = '';
             try {
                 result = await pywebview.api.pick_and_check_batch();
             } finally {
                 setLoading(false);
                 clearHintLoading();
+                hideBatchProgress();
             }
             if (!result) return;
             appendOutput(result);
@@ -1405,6 +1626,48 @@ html = """
             if (select) select.value = modalSelectedFile;
             closeFileModal();
             runMainParser();
+        }
+
+        function openReferenceUpdateModal() {
+            const modal = document.getElementById('referenceModal');
+            const list = document.getElementById('referenceCategoryList');
+            if (!modal || !list) return;
+            list.innerHTML = 'Загрузка...';
+            modal.classList.add('active');
+            pywebview.api.get_reference_update_categories().then(categories => {
+                if (!categories || categories.length === 0) {
+                    list.innerHTML = '<div class="modal-item">Категории не найдены</div>';
+                    return;
+                }
+                list.innerHTML = '';
+                categories.forEach(cat => {
+                    const item = document.createElement('div');
+                    item.className = 'modal-item';
+                    item.textContent = cat.label;
+                    item.onclick = () => selectReferenceCategory(cat.key);
+                    list.appendChild(item);
+                });
+            });
+        }
+
+        function closeReferenceModal() {
+            const modal = document.getElementById('referenceModal');
+            if (modal) modal.classList.remove('active');
+        }
+
+        async function selectReferenceCategory(key) {
+            closeReferenceModal();
+            setLoading(true);
+            setHintLoading('Обновление справочника');
+            let result = '';
+            try {
+                result = await pywebview.api.update_reference_file(key);
+            } finally {
+                setLoading(false);
+                clearHintLoading();
+            }
+            if (!result) return;
+            appendOutput(result);
         }
 
         function createNewRequestWithTitle(title) {
