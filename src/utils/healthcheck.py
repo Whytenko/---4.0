@@ -199,13 +199,18 @@ def run_self_check(write_logs: bool = True) -> Dict[str, object]:
     if temp_files:
         checks.append(_item("reference:temperature", "ok", f"Found {len(temp_files)} temperature table(s)", temp_files[0]))
     else:
+        # Не в репозитории намеренно: файл присылают из другого отдела и
+        # обновляют каждый день/месяц — коммитить в git его не нужно, а
+        # загрузить оператор может через кнопку "Обновить справочник" в
+        # интерфейсе. Поэтому warn, а не error — отсутствие при первом
+        # запуске на новой машине не должно выглядеть как поломка.
         checks.append(
             _item(
                 "reference:temperature",
-                "error",
-                "Temperature table file is missing",
+                "warn",
+                "Temperature table file is missing — load it via \"Обновить справочник\" in the app",
                 ref_dir,
-                "Add 20. Отчет по температуре.xlsx (or 2026 variant).",
+                "Add 20. Отчет по температуре.xlsx (or 2026 variant), or use the update button in the app.",
             )
         )
 
