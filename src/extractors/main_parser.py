@@ -141,6 +141,9 @@ class WellData:
     contract_number_display: str = ""
     total_cost: str = ""
     performed_tasks: str = ""
+    # Номер договора со страницы "АКТ-ЗАКАЗ" (стр.2) — сверяется с
+    # contract_number_display (титульный лист, стр.1).
+    page2_contract_number: str = ""
     # Результаты доп.проверок, вычисленных в parse_all из строк расценок
     # (барометрия@53, тех.дежурство >4ч, пересечение термометрии 200/500)
     check_results: dict = field(default_factory=dict)
@@ -180,6 +183,8 @@ class WellData:
         ("volume_qty", lambda self: self._check_volume_qty(),
          "Сравнение объемов (стр.1) и кол-ва (стр.3)", False),
         ("page2_dates", lambda self: self._check_page2_dates(), "Сравнение дат (стр.2)", False),
+        ("contract_number_page2", lambda self: self._check_contract_number_page2(),
+         "Сравнение номера договора (стр.2)", False),
     )
     _CHECK_REGISTRY_AFTER_ML: ClassVar[tuple] = (
         ("integral", lambda self: self._check_integral(), "Интегральный коэффициент", False),
@@ -350,6 +355,19 @@ class WellData:
                 f"    Начало работ: {start1} / {start2}",
                 f"    Окончание работ: {end1} / {end2}",
             ],
+        }
+
+    def _check_contract_number_page2(self) -> dict:
+        """Номер договора: титульный лист (стр.1) vs АКТ-ЗАКАЗ (стр.2) —
+        тот же принцип, что и сравнение дат выше."""
+        page1_value = self.contract_number_display
+        page2_value = self.page2_contract_number
+        if not page1_value or not page2_value:
+            return {"status": "conditional_ok", "value_text": "условно ✅"}
+        match = page1_value == page2_value
+        return {
+            "status": "ok" if match else "bad",
+            "details": [f"    Номер договора: {page1_value} / {page2_value}"],
         }
 
     def _check_integral(self) -> dict:
@@ -605,6 +623,8 @@ class FinalUnifiedParser:
                 well_data.act_number, well_data.act_date = self._parse_act_number_and_date(text)
                 well_data.total_cost = self._parse_total_cost(text)
                 well_data.performed_tasks = self._parse_performed_tasks(text)
+                if scan_idx is not None and scan_idx < len(pdf.pages):
+                    well_data.page2_contract_number = self._parse_contract_number_page2(pdf.pages[scan_idx])
 
                 rate_rows = self._extract_rate_rows_page1(pdf, header_idx)
                 rate_status, rate_details = self._check_rate_prices_from_rows(rate_rows)
@@ -1054,9 +1074,12 @@ class FinalUnifiedParser:
             norm_part = "норма: нет данных"
             if norm_enabled:
                 if not ref_norms:
+                    # Не штрафуем строку за отсутствие нормы в справочнике —
+                    # у "договорных" расценок из Прейскуранта цен (в отличие
+                    # от ЕНВиР) нормы времени в принципе не предусмотрено,
+                    # и цена там уже сверяется отдельно (price_ok/price_bad).
                     norm_missing_ref += 1
-                    row_has_issue = True
-                    norm_part = "норма: в прил. не найдена"
+                    norm_part = "норма: не предусмотрена для этой расценки"
                 elif not isinstance(act_norm, (int, float)):
                     norm_missing_act += 1
                     row_has_issue = True
@@ -1137,7 +1160,7 @@ class FinalUnifiedParser:
             or price_bad > 0
             or price_missing > 0
             or spent_bad > 0
-            or (norm_enabled and (norm_bad > 0 or norm_missing_ref > 0 or norm_missing_act > 0))
+            or (norm_enabled and (norm_bad > 0 or norm_missing_act > 0))
         )
         status = "bad" if status_is_bad else "ok"
         return status, summary_lines + details
@@ -1733,12 +1756,18 @@ class FinalUnifiedParser:
         if '0.1.12.2025' in line or '0.1.12' in line:
             return f"01.12.2025 {hour}:{minute}"
         
-        # Стандартный формат
-        match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4})', line)
+        # Стандартный формат — год бывает и двузначным ("09.08.26" в
+        # АКТ-ЗАКАЗ на производство ГИРС новых актов, не только "2026").
+        # {2,4} — не альтернация "\d{2}|\d{4}": та пробует двузначный
+        # вариант первым и останавливается на первых 2 цифрах "2026",
+        # ошибочно давая год "20" (позже становящийся "2020").
+        match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{2,4})', line)
         if match:
             day = match.group(1).zfill(2)
             month = match.group(2).zfill(2)
             year = match.group(3)
+            if len(year) == 2:
+                year = "20" + year
             return f"{day}.{month}.{year} {hour}:{minute}"
         
         # Поиск по цифрам
@@ -2001,6 +2030,40 @@ class FinalUnifiedParser:
             total += last_three[1]
         return f"{total:.2f}" if total > 0 else ""
 
+    def _parse_contract_number_page2(self, page) -> str:
+        """Номер договора со страницы «АКТ-ЗАКАЗ» ('Договор № 2026008065' /
+        'Договор № 22С3286') — для сверки с номером на титульном листе,
+        по тому же принципу, что и _ocr_page_start_end: сначала пробуем
+        текстовый слой (цифровые акты), затем OCR области в левом верхнем
+        углу формы (где стоит поле «Договор №» на сканах)."""
+        try:
+            direct_text = page.extract_text() or ""
+        except Exception:
+            direct_text = ""
+        if direct_text:
+            match = re.search(r'Договор\s*№\s*([0-9A-ZА-Я]+)', direct_text)
+            if match:
+                return match.group(1)
+
+        try:
+            import pytesseract
+            from PIL import ImageOps
+        except Exception:
+            return ""
+        if not self._configure_tesseract(pytesseract):
+            return ""
+        h, w = page.height, page.width
+        crop = page.crop((w * 0.0, h * 0.08, w * 0.48, h * 0.20))
+        image = crop.to_image(resolution=300).original
+        gray = ImageOps.grayscale(image)
+        gray = ImageOps.autocontrast(gray)
+        try:
+            text = pytesseract.image_to_string(gray, lang="rus+eng", config="--psm 6", timeout=10)
+        except Exception:
+            return ""
+        match = re.search(r'Договор\s*№\s*([0-9A-ZА-Я]+)', text, re.IGNORECASE)
+        return match.group(1) if match else ""
+
     def _parse_page2_start_end(self, pdf, candidate_indices=None):
         """Ищет страницу со сканом «АКТ-ЗАКАЗ» (Начало работы на объекте /
         Окончание работы партии) среди candidate_indices, пробуя OCR на
@@ -2020,6 +2083,31 @@ class FinalUnifiedParser:
         return "", "", None
 
     def _ocr_page_start_end(self, page) -> tuple[str, str]:
+        # Часть реальных актов (новые, с середины 2026 г.) кладут АКТ-ЗАКАЗ
+        # цифровым текстом, а не сканом — extract_text() тогда даёт точный
+        # результат бесплатно, без OCR. Пробуем его первым; OCR — только
+        # если текстового слоя нет (настоящий скан) или в нём не нашлось
+        # нужных строк.
+        try:
+            direct_text = page.extract_text() or ""
+        except Exception:
+            direct_text = ""
+        if direct_text:
+            start, end = "", ""
+            for line in direct_text.splitlines():
+                if not start and "Начало работ" in line:
+                    candidate = self._extract_date_from_line(line)
+                    if candidate != "не найдено":
+                        start = candidate
+                if not end and "Окончание работ" in line:
+                    candidate = self._extract_date_from_line(line)
+                    if candidate != "не найдено":
+                        end = candidate
+                if start and end:
+                    break
+            if start and end:
+                return start, end
+
         try:
             import pytesseract
             from PIL import ImageOps
@@ -2031,8 +2119,13 @@ class FinalUnifiedParser:
         w = page.width
         # Crop the right-middle block with start/end lines
         crop = page.crop((w * 0.60, h * 0.30, w * 0.98, h * 0.65))
-        image = crop.to_image(resolution=250).original
-        text = pytesseract.image_to_string(image, lang="rus+eng", config="--psm 6", timeout=10)
+        image = crop.to_image(resolution=300).original
+        # Серая шкала + автоконтраст: жёсткая бинаризация по порогу здесь
+        # только портит мелкий шрифт этого скана (проверено на реальных
+        # актах) — без неё OCR стабильно читает и метки, и сами даты.
+        gray = ImageOps.grayscale(image)
+        gray = ImageOps.autocontrast(gray)
+        text = pytesseract.image_to_string(gray, lang="rus+eng", config="--psm 6", timeout=10)
         text = text.replace("..", ".").replace(" .", ".").replace("|", ".")
 
         def _find_after(label: str) -> str:
@@ -2083,30 +2176,13 @@ class FinalUnifiedParser:
         end = _find_after("Окончание работы партии")
         if not end:
             end = _find_after("Окончание работ партии")
-        if start and end:
-            return start, end
-
-        try:
-            text = page.extract_text() or ""
-            lines = text.splitlines()
-            start = ""
-            end = ""
-            for line in lines:
-                if not start and "Начало работ" in line:
-                    start = self._extract_date_from_line(line)
-                if not end and "Окончание работ" in line:
-                    end = self._extract_date_from_line(line)
-                if start and end:
-                    break
-            if start and end:
-                return start, end
-        except Exception:
-            pass
-
-        matches = re.findall(r'(\d{2}\.\d{2}\.\d{4}\s+\d{2}[:\.]\d{2})', text)
-        if len(matches) >= 2:
-            return matches[0].replace(".", ":", 1), matches[1].replace(".", ":", 1)
-        return "", ""
+        # Раньше здесь был запасной regex, вытаскивающий "первые две даты"
+        # из всего OCR-текста без привязки к меткам — на реальных актах он
+        # регулярно подхватывал чужие поля ("Прибытие на объект", "Заказ
+        # подтвержден в"), давая правдоподобно выглядящие, но неверные
+        # даты. Честное "не найдено" (→ conditional_ok выше по стеку)
+        # безопаснее, чем уверенно неверное значение.
+        return start, end
 
     def _parse_page1_dates_ocr(self, pdf, page_idx: int = 0):
         if not pdf.pages or page_idx >= len(pdf.pages):
@@ -2178,11 +2254,21 @@ class PDFProcessor:
         
         return self.all_wells_data
 
-    def process_pdfs(self, pdf_paths: List[Path]) -> List[WellData]:
-        """Обрабатывает указанные PDF файлы"""
-        for pdf_file in pdf_paths:
+    def process_pdfs(self, pdf_paths: List[Path], progress_callback=None) -> List[WellData]:
+        """Обрабатывает указанные PDF файлы.
+
+        progress_callback(current, total, filename), если задан, вызывается
+        после обработки каждого файла — используется для индикатора
+        прогресса в GUI при пакетной проверке."""
+        total = len(pdf_paths)
+        for idx, pdf_file in enumerate(pdf_paths, start=1):
             well_data = self.parser.parse_all(str(pdf_file))
             self.all_wells_data.append(well_data)
+            if progress_callback is not None:
+                try:
+                    progress_callback(idx, total, pdf_file.name if isinstance(pdf_file, Path) else os.path.basename(str(pdf_file)))
+                except Exception:
+                    pass
         return self.all_wells_data
     
     def print_all_results(self):
