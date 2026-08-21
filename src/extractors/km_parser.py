@@ -122,17 +122,56 @@ def get_report_values(field: str, bush: str):
         )
     return None, None, None
 
+def _ocr_relocation_area(page) -> str:
+    """OCR той же области скана «АКТ-ЗАКАЗ», где main_parser читает даты
+    («Начало/Окончание работы...») — чуть ниже в той же колонке стоит
+    «Приезд на базу (переезд на другой объект)», которую здесь и ищем."""
+    try:
+        import pytesseract
+        from PIL import ImageOps
+    except Exception:
+        return ""
+    try:
+        from src.extractors.main_parser import FinalUnifiedParser
+    except Exception:
+        return ""
+    if not FinalUnifiedParser()._configure_tesseract(pytesseract):
+        return ""
+    h, w = page.height, page.width
+    crop = page.crop((w * 0.60, h * 0.30, w * 0.98, h * 0.65))
+    image = crop.to_image(resolution=300).original
+    gray = ImageOps.grayscale(image)
+    gray = ImageOps.autocontrast(gray)
+    try:
+        return pytesseract.image_to_string(gray, lang="rus+eng", config="--psm 6", timeout=10)
+    except Exception:
+        return ""
+
+
 def _has_relocation_note(pdf) -> bool:
     """На 2 листе иногда стоит пометка 'Приезд на базу (переезд на другой
     объект)' — по инструкции это законная причина, почему объём переезда в
-    акте меньше отчётного (часть маршрута выполнена в рамках другого акта)."""
-    if len(pdf.pages) < 2:
-        return False
-    try:
-        page2_text = pdf.pages[1].extract_text() or ""
-    except Exception:
-        return False
-    return "переезд на другой объект" in page2_text.lower()
+    акте меньше отчётного (часть маршрута выполнена в рамках другого акта).
+    Эта страница обычно отсканирована как картинка (extract_text пуст), а
+    физическая позиция может сдвигаться — поэтому пробуем несколько первых
+    страниц и, если текста нет, распознаём его через OCR. Также встречается
+    формулировка "далее задача №..." вместо явного "переезд на другой
+    объект" — партия едет прямо на следующую задачу, не возвращаясь на базу."""
+    for idx in range(min(len(pdf.pages), 4)):
+        try:
+            text = pdf.pages[idx].extract_text() or ""
+        except Exception:
+            text = ""
+        if not text:
+            text = _ocr_relocation_area(pdf.pages[idx])
+        norm = text.lower()
+        # Короткий, устойчивый к OCR-ошибкам фрагмент: слово "переезд" в
+        # начале фразы искажается чаще всего ("езл на другой объект)"
+        # вместо "переезд на другой объект)" — по факту OCR реальных
+        # сканов), а "на другой объект" распознаётся стабильно.
+        if "на другой объект" in norm or "далее задача" in norm:
+            return True
+    return False
 
 
 def compute_km_report(pdf_path: Path) -> dict:
