@@ -144,6 +144,10 @@ class WellData:
     # Номер договора со страницы "АКТ-ЗАКАЗ" (стр.2) — сверяется с
     # contract_number_display (титульный лист, стр.1).
     page2_contract_number: str = ""
+    # Номер задачи из заявки, встроенной в тот же PDF (обычно стр.4) —
+    # для колонки "Заявка" в реестре, когда заявка не приходит отдельным
+    # файлом (в реальных пакетах — почти всегда так).
+    embedded_zayavka_task: str = ""
     # Результаты доп.проверок, вычисленных в parse_all из строк расценок
     # (барометрия@53, тех.дежурство >4ч, пересечение термометрии 200/500)
     check_results: dict = field(default_factory=dict)
@@ -197,6 +201,9 @@ class WellData:
         ("thermometry_overlap",
          lambda self: self._prefix_details(self.check_results.get("thermometry_overlap", {"status": "neutral"})),
          "Термометрия 200/500 (пересечение)", True),
+        ("interval_length",
+         lambda self: self._prefix_details(self.check_results.get("interval_length", {"status": "neutral"})),
+         "Интервал ≤100м (стр.1)", True),
         ("zayavka", lambda self: self._check_zayavka(), "Сверка с заявкой", True),
     )
 
@@ -409,6 +416,46 @@ class WellData:
         if not result.get("details"):
             return result
         return {**result, "details": [f"    {line}" for line in result["details"]]}
+
+    def _check_interval_length(self, rows: List[dict]) -> dict:
+        """Интервал перфорации (до-от) на стр.1 не должен превышать 100м —
+        проверено на реальных актах: расценка "Перфорация на кабеле с
+        привязкой" всегда даёт интервал ровно 100 м, независимо от объёма
+        (единица измерения "опер.", не "100м"). Больший интервал в одной
+        строке обычно означает ошибку заполнения (фактически нужны две
+        операции перфорации по 100м, а не одна) — переплата за интервал,
+        не подтверждённый отдельной операцией.
+
+        Ограничено строго строками перфорации по названию: многие другие
+        расценки (термометрия, влагометрия, профиль притока и т.п.) на
+        реальных актах законно охватывают весь ствол скважины интервалом
+        в сотни-тысячи метров — это не ошибка, это их обычный режим
+        работы, и применять к ним тот же порог 100м неверно."""
+        threshold = 100.0
+        flagged: List[str] = []
+        checked = 0
+        for row in rows:
+            name = str(row.get("name", "")).strip()
+            if "перфораци" not in name.lower():
+                continue
+            interval_from = row.get("interval_from")
+            interval_to = row.get("interval_to")
+            if not isinstance(interval_from, (int, float)) or not isinstance(interval_to, (int, float)):
+                continue
+            length = interval_to - interval_from
+            if length <= 0:
+                continue
+            checked += 1
+            if length > threshold + 0.1:
+                name_short = name if len(name) <= 70 else f"{name[:67]}..."
+                flagged.append(
+                    f"❌ {name_short} | интервал {interval_from:g}-{interval_to:g} = {length:.1f} м > {threshold:.0f} м"
+                )
+        if checked == 0:
+            return {"status": "neutral"}
+        if flagged:
+            return {"status": "bad", "details": flagged}
+        return {"status": "ok", "details": [f"В норме (≤{threshold:.0f} м), строк перфорации: {checked}"]}
 
     def _check_barometry_task53(self, rows: List[dict]) -> dict:
         task = str(self.task_number or "").strip()
@@ -623,6 +670,7 @@ class FinalUnifiedParser:
                 well_data.act_number, well_data.act_date = self._parse_act_number_and_date(text)
                 well_data.total_cost = self._parse_total_cost(text)
                 well_data.performed_tasks = self._parse_performed_tasks(text)
+                well_data.embedded_zayavka_task = self._parse_embedded_zayavka_task(pdf)
                 if scan_idx is not None and scan_idx < len(pdf.pages):
                     well_data.page2_contract_number = self._parse_contract_number_page2(pdf.pages[scan_idx])
 
@@ -643,6 +691,7 @@ class FinalUnifiedParser:
                 well_data.check_results["barometry_task53"] = well_data._check_barometry_task53(rate_rows)
                 well_data.check_results["tech_duty"] = well_data._check_tech_duty_hours(rate_rows)
                 well_data.check_results["thermometry_overlap"] = well_data._check_thermometry_overlap(rate_rows)
+                well_data.check_results["interval_length"] = well_data._check_interval_length(rate_rows)
 
                 if well_data.start_date == "не найдено" or well_data.end_date == "не найдено":
                     start_ocr, end_ocr = self._parse_page1_dates_ocr(pdf, header_idx)
@@ -868,11 +917,21 @@ class FinalUnifiedParser:
                     coeff_col = col_idx
                 if "затрат" in norm and "времен" in norm:
                     spent_col = col_idx
-                if "интервал" in norm and interval_from_col is None:
-                    interval_from_col = col_idx
-                    interval_to_col = col_idx + 1
             if number_col is not None and price_col is not None:
                 header_idx = idx
+                # "интервал" ищем только в строке, уже подтверждённой как
+                # заголовок таблицы (где нашлись номер расценки и цена) —
+                # иначе случайное упоминание слова в титульной "шапке" акта
+                # (например "интервалов перфорации" в описании задачи №53,
+                # это одна огромная ячейка в table[0]) ложно фиксирует
+                # interval_from_col на колонке названия работ, а
+                # interval_to_col — на колонке номера расценки.
+                for col_idx, cell in enumerate(row):
+                    norm = self._normalize_for_match(cell)
+                    if "интервал" in norm:
+                        interval_from_col = col_idx
+                        interval_to_col = col_idx + 1
+                        break
                 break
 
         if header_idx is None:
@@ -1248,6 +1307,24 @@ class FinalUnifiedParser:
     def _parse_task_number(self, text: str) -> str:
         """Номер задачи (например 53, 87(Р), 500.4, 58.158)"""
         match = re.search(r'Задача\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)', text)
+        return match.group(1) if match else ""
+
+    def _parse_embedded_zayavka_task(self, pdf) -> str:
+        """Номер задачи из заявки, встроенной в тот же PDF (лист "ЗАЯВКА на
+        проведение промыслово-геофизических исследований скважин",
+        формат "ПГИ № 80 (...)") — в реальных актах заявка почти всегда
+        приходит НЕ отдельным файлом, а отдельной страницей внутри акта
+        (обычно 4-й), поэтому колонка "Заявка" в реестре иначе всегда
+        пустая. Ищем по содержимому, а не по номеру страницы — по тому
+        же принципу, что и заголовок/Приложение №1."""
+        idx = self._find_page_index(pdf, ("на проведение промыслово-геофизических",))
+        if idx is None:
+            return ""
+        try:
+            text = pdf.pages[idx].extract_text() or ""
+        except Exception:
+            return ""
+        match = re.search(r'ПГИ\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)', text)
         return match.group(1) if match else ""
 
     def _parse_performed_tasks(self, text: str) -> str:
