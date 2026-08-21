@@ -69,6 +69,7 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
             checks["barometry_task53"]["status"],
             checks["tech_duty"]["status"],
             checks["thermometry_overlap"]["status"],
+            checks["interval_length"]["status"],
             checks["zayavka"]["status"],
             temp_status["status"],
             km_status["status"],
@@ -95,6 +96,7 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
                 "Барометрия@53": _label(checks["barometry_task53"]["status"]),
                 "Тех.дежурство >4ч": _label(checks["tech_duty"]["status"]),
                 "Термометрия 200/500": _label(checks["thermometry_overlap"]["status"]),
+                "Интервал ≤100м (стр.1)": _label(checks["interval_length"]["status"]),
                 "Сверка с заявкой": _label(checks["zayavka"]["status"]),
                 "Температура": _label(temp_status["status"]),
                 "Километраж": _label(km_status["status"]),
@@ -153,7 +155,11 @@ def _build_registry_df(wells_data: List) -> pd.DataFrame:
                 "Окончание работ": well_data.end_date,
                 "Стоимость": _to_number(well_data.total_cost),
                 "Проведенный ГИС": well_data.performed_tasks,
-                "Заявка": well_data.matched_zayavka_task,
+                # matched_zayavka_task — если заявка пришла отдельным файлом
+                # пакета; embedded_zayavka_task — если заявка встроена в тот
+                # же PDF отдельной страницей (в реальных пакетах — почти
+                # всегда так, отдельного файла-заявки нет вовсе).
+                "Заявка": well_data.matched_zayavka_task or well_data.embedded_zayavka_task,
                 "Комментарии": "",
             }
         )

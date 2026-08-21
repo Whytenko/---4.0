@@ -32,6 +32,51 @@ class BatchResult:
     classifications: List[tuple] = field(default_factory=list)
 
 
+def _format_temperature_line(well_data) -> str:
+    """Компактная строка для консольного вывода: '+' если всё сошлось,
+    иначе — краткое, но понятное описание расхождения (не просто ❌)."""
+    from src.extractors import table_parser
+
+    result = table_parser.get_temperature_status(well_data)
+    status = result.get("status")
+    if status == "ok":
+        return "Температура: +"
+    if status == "bad":
+        return (
+            f"Температура: ❌ в акте {result['pdf_temp']:.1f}°C, "
+            f"по отчёту {result['avg_temp']:.1f}°C (разница {result['diff']:.1f}°C, допуск 5°C)"
+        )
+    return "Температура: нет данных для сверки"
+
+
+def _format_km_line(pdf_path: Path) -> str:
+    """Компактная строка по километражу: '+' если всё сошлось, иначе —
+    какая именно категория (1 гр./3 гр./бездорожье) разошлась и на сколько."""
+    from src.extractors import km_parser
+
+    result = km_parser.compute_km_report(pdf_path)
+    status = result.get("status")
+    if status == "ok":
+        return "Километраж: +"
+    if status == "neutral":
+        return "Километраж: нет данных для сверки"
+    if status == "conditional_ok":
+        return "Километраж: + (меньше нормы, но есть отметка о переезде на другой объект)"
+
+    issues = []
+    for label, actual_key, ref_key, result_key in (
+        ("1 гр.", "v1", "r1", "result1"),
+        ("3 гр.", "v3", "r3", "result3"),
+        ("бездорожье", "voff", "roff", "result_off"),
+    ):
+        if result.get(result_key) == "bad":
+            actual = result.get(actual_key)
+            ref = result.get(ref_key)
+            issues.append(f"{label} акт {actual:.1f} / отчёт {ref:.1f}")
+    detail = "; ".join(issues) if issues else "расхождение с отчётом"
+    return f"Километраж: ❌ {detail}"
+
+
 def run_batch_pipeline(pdf_paths: List[Path], progress_callback=None) -> BatchResult:
     """Классифицирует файлы пакета, парсит акты, сверяет с заявками и
     собирает сводный Excel-отчёт. Не поднимает исключения наружу — любая
@@ -94,6 +139,14 @@ def run_batch_pipeline(pdf_paths: List[Path], progress_callback=None) -> BatchRe
             if result.zayavki:
                 apply_zayavka_checks(result.wells_data, result.zayavki)
             processor.print_all_results()
+            # Температура и километраж не входят в единый реестр проверок
+            # WellData (это отдельные модули, km_parser ещё и открывает PDF
+            # заново) — печатаем их отдельно тем же компактным форматом,
+            # иначе при пакетной проверке их не видно вовсе, только в Excel.
+            for path, well_data in zip(result.akt_paths, result.wells_data):
+                print(f"\n{well_data.filename}:")
+                print(f"  {_format_temperature_line(well_data)}")
+                print(f"  {_format_km_line(Path(path))}")
         _notify("report", len(result.akt_paths), len(result.akt_paths), "")
         if result.akt_paths:
             result.report_path = build_batch_report(result.akt_paths, result.wells_data)
