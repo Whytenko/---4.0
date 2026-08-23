@@ -2089,11 +2089,63 @@ class FinalUnifiedParser:
         return candidates
 
     def _parse_qty_sum_page3(self, pdf, page_idx: Optional[int] = None) -> str:
+        """Сумма колонки "Всего" в таблице "Приложение №1... Выполненный
+        объем исследований и работ" (стр.3) — сравнивается с "Объём
+        работ" на стр.1 (обе величины — метраж × кол-во замеров для
+        расценки; "Кол-во" на стр.3 это отдельная характеристика, число
+        повторов/замеров, не аналог объёма). Раньше бралась через regex
+        по тексту строки (последние 3 числа, второе — по факту "Всего",
+        несмотря на вводящее в заблуждение имя поля) — ломалось на
+        десятичных объёмах ("30.66" разбивается на "30" и "66" отдельными
+        числами, сдвигая индексацию) и на строках без итоговых чисел
+        (контрольные замеры), где regex подхватывал глубину интервала
+        вместо нужного числа — на одном реальном акте это дало сумму
+        3030 вместо честных 65.32. Теперь колонка находится по заголовку
+        таблицы, как и в _extract_rate_rows_from_table."""
         if page_idx is None:
             page_idx = 2
         if len(pdf.pages) <= page_idx:
             return ""
-        text = pdf.pages[page_idx].extract_text() or ""
+        page = pdf.pages[page_idx]
+
+        try:
+            tables = page.extract_tables() or []
+        except Exception:
+            tables = []
+
+        for table in tables:
+            qty_col = None
+            header_idx = None
+            for idx, row in enumerate(table[:5]):
+                if not row:
+                    continue
+                for col_idx, cell in enumerate(row):
+                    norm = self._normalize_for_match(cell)
+                    if "всего" in norm:
+                        qty_col = col_idx
+                if qty_col is not None:
+                    header_idx = idx
+                    break
+            if qty_col is None:
+                continue
+
+            total = 0.0
+            found_any = False
+            for row in table[header_idx + 1:]:
+                if not row or qty_col >= len(row):
+                    continue
+                value = self._parse_decimal(row[qty_col])
+                if value is None:
+                    continue
+                total += value
+                found_any = True
+            if found_any:
+                return f"{total:.2f}" if total > 0 else ""
+
+        # Резерв на случай, если на странице нет таблицы, извлекаемой
+        # pdfplumber (например скан без текстового слоя) — старая
+        # текстовая эвристика лучше, чем совсем ничего.
+        text = page.extract_text() or ""
         lines = text.splitlines()
         total = 0.0
         for line in lines:
