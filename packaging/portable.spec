@@ -71,7 +71,12 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # pyarrow (arrow.dll) — крашит процесс access violation'ом на связке
+    # Python 3.13, если случайно попадёт в сборку как транзитивная
+    # зависимость. requirements.txt уже держит pandas<3.0 (не требует
+    # pyarrow), это исключение — вторая линия защиты на случай, если
+    # pyarrow всё равно окажется установлен в окружении сборки.
+    excludes=["pyarrow"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
