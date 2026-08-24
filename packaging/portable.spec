@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 project_root = Path.cwd()
 app_name = "AKTNaryadVerifier"
@@ -10,6 +10,13 @@ datas = [
     (str(project_root / "data" / "reference"), "data/reference"),
     (str(project_root / "MLdata(Лист1)-2.csv"), "."),
 ]
+
+# webview хранит JS-мост (js/api.js и др.) и нативные WebView2 DLL
+# (WebView2Loader.dll, WebBrowserInterop.x64.dll и т.д.) как файлы данных
+# пакета, а не Python-модули — collect_submodules их не подхватывает.
+# Без них статический HTML/CSS рисуется нормально, а любой вызов
+# pywebview.api.*() из JS зависает навсегда: мост никогда не подключается.
+datas += collect_data_files("webview")
 
 tesseract_dir = project_root / "tesseract"
 if tesseract_dir.exists():

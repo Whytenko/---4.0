@@ -5,6 +5,8 @@ __pycache__/
 venv/
 build/
 dist/
+release/
+tesseract/
 *.egg-info/
 .DS_Store
 .claude/settings.local.json
