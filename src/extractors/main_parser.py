@@ -148,6 +148,11 @@ class WellData:
     # для колонки "Заявка" в реестре, когда заявка не приходит отдельным
     # файлом (в реальных пакетах — почти всегда так).
     embedded_zayavka_task: str = ""
+    # "Всего выполнено" по расценке 348 ("Спуск или подъем скв. прибора
+    # через лубр.") из таблицы "Прочие виды работ" на акт-заказе (стр.2) —
+    # для сверки с той же расценкой в таблице расценок акт-наряда (стр.1).
+    # Обе величины в одних единицах (100 м).
+    page2_spo: str = ""
     # Результаты доп.проверок, вычисленных в parse_all из строк расценок
     # (барометрия@53, тех.дежурство >4ч, пересечение термометрии 200/500)
     check_results: dict = field(default_factory=dict)
@@ -204,6 +209,9 @@ class WellData:
         ("interval_length",
          lambda self: self._prefix_details(self.check_results.get("interval_length", {"status": "neutral"})),
          "Интервал ≤100м (стр.1)", True),
+        ("spo_zakaz",
+         lambda self: self._prefix_details(self.check_results.get("spo_zakaz", {"status": "neutral"})),
+         "СПО: акт-наряд vs акт-заказ", True),
         ("zayavka", lambda self: self._check_zayavka(), "Сверка с заявкой", True),
     )
 
@@ -457,6 +465,48 @@ class WellData:
             return {"status": "bad", "details": flagged}
         return {"status": "ok", "details": [f"В норме (≤{threshold:.0f} м), строк перфорации: {checked}"]}
 
+    def _check_spo_zakaz(self, rows: List[dict]) -> dict:
+        """СПО (расценка 348 "Спуск или подъем скв. прибора через лубр.")
+        должно совпадать между таблицей расценок акт-наряда (стр.1) и
+        таблицей "Прочие виды работ" акт-заказа (стр.2) — обе величины
+        в одних единицах (100 м), без эвристики ×100/÷100, которая
+        нужна старой проверке "spo" (сверка с текстовой строкой на
+        странице "Справка по зарегистрированному материалу").
+
+        Если расценки 348 нет вовсе на одной из двух страниц, а на
+        другой есть ненулевое значение — это и есть основной случай,
+        который старая проверка пропускала молча (self.volume оставался
+        пустым, и _check_volume_spo просто не срабатывал): СПО-работа
+        зафиксирована как выполненная на одной странице, но не выставлена
+        к оплате (или наоборот) на другой."""
+        naryad_value = None
+        for row in rows:
+            if row.get("rate_number") == "348":
+                naryad_value = row.get("volume")
+                break
+
+        zakaz_raw = str(self.page2_spo or "").strip()
+        if not zakaz_raw:
+            # Таблицу "Прочие виды работ" на акт-заказе не нашли/не
+            # распознали для этого акта — недостаточно данных, а не
+            # подтверждённое расхождение.
+            return {"status": "neutral"}
+
+        zakaz_value = self._to_float(zakaz_raw) or 0.0
+        naryad_value = naryad_value if naryad_value is not None else 0.0
+
+        if naryad_value == 0.0 and zakaz_value == 0.0:
+            return {"status": "neutral"}
+
+        match = abs(naryad_value - zakaz_value) < 0.015
+        return {
+            "status": "ok" if match else "bad",
+            "details": [
+                f"    СПО в акт-наряде (расц. 348, стр.1) = {naryad_value:.2f}",
+                f"    СПО в акт-заказе (стр.2) = {zakaz_value:.2f}",
+            ],
+        }
+
     def _check_barometry_task53(self, rows: List[dict]) -> dict:
         task = str(self.task_number or "").strip()
         if task != "53":
@@ -673,6 +723,7 @@ class FinalUnifiedParser:
                 well_data.embedded_zayavka_task = self._parse_embedded_zayavka_task(pdf)
                 if scan_idx is not None and scan_idx < len(pdf.pages):
                     well_data.page2_contract_number = self._parse_contract_number_page2(pdf.pages[scan_idx])
+                    well_data.page2_spo = self._parse_spo_zakaz(pdf.pages[scan_idx])
 
                 rate_rows = self._extract_rate_rows_page1(pdf, header_idx)
                 rate_status, rate_details = self._check_rate_prices_from_rows(rate_rows)
@@ -692,6 +743,7 @@ class FinalUnifiedParser:
                 well_data.check_results["tech_duty"] = well_data._check_tech_duty_hours(rate_rows)
                 well_data.check_results["thermometry_overlap"] = well_data._check_thermometry_overlap(rate_rows)
                 well_data.check_results["interval_length"] = well_data._check_interval_length(rate_rows)
+                well_data.check_results["spo_zakaz"] = well_data._check_spo_zakaz(rate_rows)
 
                 if well_data.start_date == "не найдено" or well_data.end_date == "не найдено":
                     start_ocr, end_ocr = self._parse_page1_dates_ocr(pdf, header_idx)
@@ -1538,13 +1590,17 @@ class FinalUnifiedParser:
             .replace("M", "М")
         )
 
-        # First try direct match on the same line.
+        # "Справка по зарегистрированному материалу" пишет СПО текстом, без
+        # аббревиатуры: "Спуск-подъём прибора составил – 1135.30 м" — этот
+        # паттерн проверяем ПЕРВЫМ. Более общие паттерны на "СПО:"/"С П О:"
+        # идут следом как запасной вариант, но на реальных актах акт-заказ
+        # (стр.2) содержит поле-decoy "Условия проведения СПО 4" — если
+        # общий паттерн проверить раньше специфичного, он вслепую цепляет
+        # эту постороннюю цифру "4" вместо настоящего метража со «Справки».
         patterns = [
+            r'Спуск[\s\-]*подъ[её]м\s*прибора\s*составил\s*[-–:]?\s*([\d\s]+[,\.\d]*)\s*м',
             r'С\s*П\s*О\s*[:\-]?\s*([\d\s]+[,\.\d]*)\s*м?',
             r'СПО\s*[:\-]?\s*([\d\s]+[,\.\d]*)\s*м?',
-            # "Справка по зарегистрированному материалу" пишет СПО текстом,
-            # без аббревиатуры: "Спуск-подъём прибора составил – 1135.30 м"
-            r'Спуск[\s\-]*подъ[её]м\s*прибора\s*составил\s*[-–:]?\s*([\d\s]+[,\.\d]*)\s*м',
         ]
         for pattern in patterns:
             for match in re.finditer(pattern, normalized, re.IGNORECASE):
@@ -2192,6 +2248,51 @@ class FinalUnifiedParser:
             return ""
         match = re.search(r'Договор\s*№\s*([0-9A-ZА-Я]+)', text, re.IGNORECASE)
         return match.group(1) if match else ""
+
+    def _parse_spo_zakaz(self, page) -> str:
+        """"Всего выполнено" по расценке 348 ("Спуск или подъем скв.
+        прибора через лубр.") из таблицы "Прочие виды работ" на
+        акт-заказе (стр.2). Таблица находится по заголовку (колонки
+        "Номер расценки" и "Всего выполнено"), а не по фиксированному
+        индексу — на реальных актах на этой странице обычно 9 таблиц
+        (шапка формы, служебные блоки дат, эта таблица расценок,
+        таблица переездов, персонал и т.д.), и их порядок/количество
+        может отличаться."""
+        try:
+            tables = page.extract_tables() or []
+        except Exception:
+            tables = []
+
+        for table in tables:
+            number_col = None
+            total_col = None
+            header_idx = None
+            for idx, row in enumerate(table[:3]):
+                if not row:
+                    continue
+                for col_idx, cell in enumerate(row):
+                    norm = self._normalize_for_match(cell)
+                    if "номер" in norm and "расц" in norm:
+                        number_col = col_idx
+                    if "всего" in norm and "выполнен" in norm:
+                        total_col = col_idx
+                if number_col is not None and total_col is not None:
+                    header_idx = idx
+                    break
+            if header_idx is None:
+                continue
+
+            for row in table[header_idx + 1:]:
+                if not row or number_col >= len(row):
+                    continue
+                rate_number = self._normalize_rate_number(row[number_col])
+                if rate_number != "348":
+                    continue
+                if total_col >= len(row):
+                    return "0.00"
+                value = self._parse_decimal(row[total_col])
+                return f"{value:.2f}" if value is not None else "0.00"
+        return ""
 
     def _parse_page2_start_end(self, pdf, candidate_indices=None):
         """Ищет страницу со сканом «АКТ-ЗАКАЗ» (Начало работы на объекте /
