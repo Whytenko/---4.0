@@ -31,6 +31,7 @@ for asset_name in (
     "km_parser.svg",
     "logo-lu.svg",
     "lukoil-desk.png",
+    "lukoil-app.ico",
     "lukoil-desk.ico",
     "lukoil35.ico",
     "lukoil35.webp",
@@ -90,9 +91,11 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
-    icon=str(project_root / "lukoil-desk.ico")
-    if (project_root / "lukoil-desk.ico").exists()
-    else (str(project_root / "lukoil35.ico") if (project_root / "lukoil35.ico").exists() else None),
+    icon=next(
+        (str(project_root / name) for name in ("lukoil-app.ico", "lukoil35.ico", "lukoil-desk.ico")
+         if (project_root / name).exists()),
+        None,
+    ),
 )
 
 coll = COLLECT(

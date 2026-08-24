@@ -1782,8 +1782,9 @@ if __name__ == "__main__":
     
     # Создаем окно
     icon_candidates = [
-        Path(__file__).parent / "lukoil-desk.ico",
+        Path(__file__).parent / "lukoil-app.ico",
         Path(__file__).parent / "lukoil35.ico",
+        Path(__file__).parent / "lukoil-desk.ico",
     ]
     icon_path = ""
     for candidate in icon_candidates:
