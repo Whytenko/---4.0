@@ -158,11 +158,24 @@ def _build_registry_df(wells_data: List) -> pd.DataFrame:
                 "Стоимость": _to_number(well_data.total_cost),
                 "Проведенный ГИС": well_data.performed_tasks,
                 # matched_zayavka_task — если заявка пришла отдельным файлом
-                # пакета; embedded_zayavka_task — если заявка встроена в тот
-                # же PDF отдельной страницей (в реальных пакетах — почти
-                # всегда так, отдельного файла-заявки нет вовсе).
-                "Заявка": well_data.matched_zayavka_task or well_data.embedded_zayavka_task,
-                "Комментарии": "",
+                # пакета; embedded_zayavka_task — распознанный (часто через
+                # OCR, надёжность ограничена) номер со встроенной страницы
+                # заявки; performed_tasks — сама задача из шапки акта, самый
+                # надёжный источник (не требует OCR). В реальном реестре
+                # заказчика "Заявка" почти всегда совпадает с "Проведенный
+                # ГИС" (заявка запрашивает именно ту задачу, что потом
+                # выполняется и фиксируется в акте), поэтому это последний
+                # и основной запасной вариант, а не безусловный OCR-приоритет.
+                "Заявка": (
+                    well_data.matched_zayavka_task
+                    or well_data.embedded_zayavka_task
+                    or well_data.performed_tasks
+                ),
+                # Свободный комментарий подрядчика (недоход, остановка
+                # прибора, осмотр перфоратора и т.д.) со страницы "АКТ" —
+                # см. _parse_zayavka_and_comment. Пусто, если такой
+                # страницы в акте нет (обычный, без замечаний акт).
+                "Комментарии": well_data.contractor_comment,
             }
         )
     return pd.DataFrame(rows)

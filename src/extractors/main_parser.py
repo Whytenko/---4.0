@@ -148,6 +148,11 @@ class WellData:
     # для колонки "Заявка" в реестре, когда заявка не приходит отдельным
     # файлом (в реальных пакетах — почти всегда так).
     embedded_zayavka_task: str = ""
+    # Свободный комментарий подрядчика со страницы "АКТ" (нижеподписавшиеся
+    # ... составили настоящий акт о том, что ...) — недоход, остановка
+    # прибора, осмотр перфоратора и т.д. Появляется не в каждом акте.
+    # Для колонки "Комментарии" в реестре "Проверка акт-нарядов".
+    contractor_comment: str = ""
     # "Всего выполнено" по расценке 348 ("Спуск или подъем скв. прибора
     # через лубр.") из таблицы "Прочие виды работ" на акт-заказе (стр.2) —
     # для сверки с той же расценкой в таблице расценок акт-наряда (стр.1).
@@ -720,7 +725,9 @@ class FinalUnifiedParser:
                 well_data.act_number, well_data.act_date = self._parse_act_number_and_date(text)
                 well_data.total_cost = self._parse_total_cost(text)
                 well_data.performed_tasks = self._parse_performed_tasks(text)
-                well_data.embedded_zayavka_task = self._parse_embedded_zayavka_task(pdf)
+                ocr_task, well_data.contractor_comment = self._parse_zayavka_and_comment(pdf)
+                if self._task_number_plausible(ocr_task, well_data.performed_tasks):
+                    well_data.embedded_zayavka_task = ocr_task
                 if scan_idx is not None and scan_idx < len(pdf.pages):
                     well_data.page2_contract_number = self._parse_contract_number_page2(pdf.pages[scan_idx])
                     well_data.page2_spo = self._parse_spo_zakaz(pdf.pages[scan_idx])
@@ -1361,23 +1368,142 @@ class FinalUnifiedParser:
         match = re.search(r'Задача\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)', text)
         return match.group(1) if match else ""
 
-    def _parse_embedded_zayavka_task(self, pdf) -> str:
-        """Номер задачи из заявки, встроенной в тот же PDF (лист "ЗАЯВКА на
-        проведение промыслово-геофизических исследований скважин",
-        формат "ПГИ № 80 (...)") — в реальных актах заявка почти всегда
-        приходит НЕ отдельным файлом, а отдельной страницей внутри акта
-        (обычно 4-й), поэтому колонка "Заявка" в реестре иначе всегда
-        пустая. Ищем по содержимому, а не по номеру страницы — по тому
-        же принципу, что и заголовок/Приложение №1."""
-        idx = self._find_page_index(pdf, ("на проведение промыслово-геофизических",))
-        if idx is None:
+    _ZAYAVKA_TASK_PATTERNS: ClassVar[tuple] = (
+        # "ПГИ № 80 (...)" — старый цифровой формат заявки.
+        re.compile(r'ПГИ\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)'),
+        # "Цель (задача) и интервал исследований: № 24 Опр...."
+        re.compile(r'Цель\s*\(задача\)[^\n]{0,60}?№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)'),
+        # "Цель, вид, объем заказываемых работ: 87 Опр...." — без "№".
+        re.compile(r'Цель,?\s*вид,?\s*объем[^\n]{0,40}?:\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)'),
+        # общий запасной вариант — как в заголовке акт-наряда/акт-заказа.
+        re.compile(r'Задача\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)'),
+    )
+
+    def _task_number_plausible(self, ocr_task: str, performed_tasks: str) -> bool:
+        """OCR номера задачи со скана заявки достаточно ненадёжен (буквы
+        путаются с цифрами, суффиксы вроде "(S)"/".134" теряются или
+        дают лишнюю цифру: "35(S)" стабильно читается как "358"). Прежде
+        чем доверять результату, сверяем его ведущие цифры с уже надёжно
+        распознанной задачей из шапки акта (task_number/performed_tasks,
+        чистый текст, без OCR) — если они не совпадают, значение отбрасываем
+        (в отчёте вместо него встанет запасной вариант performed_tasks),
+        а не показываем вероятно garbled цифры."""
+        if not ocr_task:
+            return False
+        ocr_lead = re.match(r'\d+', ocr_task)
+        if not ocr_lead:
+            return False
+        ocr_lead = ocr_lead.group()
+        for task in performed_tasks.split("+"):
+            performed_lead = re.match(r'\d+', task.strip())
+            if performed_lead and performed_lead.group() == ocr_lead:
+                return True
+        return not performed_tasks
+
+    def _match_zayavka_task(self, text: str) -> str:
+        for pattern in self._ZAYAVKA_TASK_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                return match.group(1)
+        return ""
+
+    def _extract_contractor_comment(self, text: str) -> str:
+        """Текст свободного комментария подрядчика со страницы вида
+        "ПАО «КОГАЛЫМНЕФТЕГЕОФИЗИКА» / АКТ / Мы, нижеподписавшиеся: ...
+        составили настоящий акт о том, что <дата> на скважине № X ...".
+        Такая страница появляется не в каждом акте (только когда есть что
+        отметить — недоход, остановка прибора, осмотр перфоратора после
+        извлечения и т.д.), в отличие от рутинного "АКТ проверки готовности
+        скважины" (у него тоже есть "нижеподписавшиеся", но сразу за
+        "составили настоящий акт" идёт неизменное "о том, что нами
+        проверена готовность" — исключаем именно эту формулировку)."""
+        match = re.search(r'составили\s+настоящий\s+[Аа]кт', text, re.IGNORECASE)
+        if not match:
             return ""
+        tail = text[match.end():match.end() + 250]
+        if re.search(r'проверена\s+готовност', tail, re.IGNORECASE):
+            return ""
+        body = text[match.start():].strip()
+        body = re.sub(r'\s+', ' ', body)
+        return body[:1200]
+
+    def _ocr_full_page_text(self, page, pytesseract_module) -> str:
         try:
-            text = pdf.pages[idx].extract_text() or ""
+            from PIL import ImageOps
+            image = page.to_image(resolution=200).original
+            gray = ImageOps.grayscale(image)
+            gray = ImageOps.autocontrast(gray)
+            return pytesseract_module.image_to_string(gray, lang="rus+eng", config="--psm 6", timeout=20)
         except Exception:
             return ""
-        match = re.search(r'ПГИ\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)', text)
-        return match.group(1) if match else ""
+
+    def _parse_zayavka_and_comment(self, pdf) -> tuple[str, str]:
+        """Один проход по страницам акта — номер задачи из встроенной
+        ЗАЯВКИ (лист "ЗАЯВКА на проведение промыслово-геофизических
+        исследований скважин", обычно 4-й) и текст комментария подрядчика
+        (страница "АКТ" с "нижеподписавшиеся"), оба поля — с OCR-фоллбэком:
+        на реальных актах обе страницы чаще скан, чем цифровой текст (по
+        выборке 86 актов OCR потребовался для заявки в ~65 из 82 найденных
+        случаев). Общий проход экономит OCR — не открываем те же страницы
+        дважды под каждое поле по отдельности."""
+        task_number = ""
+        comment_text = ""
+        pytesseract_module = None
+        # Комментарий подрядчика — почти всегда на последних листах пакета
+        # (после Справки по зарегистрированному материалу, ближе к концу),
+        # а не на фиксированном номере страницы: сами акты разной длины
+        # (от 7 до 16+ листов среди реальных актов). Ищем в последних 8
+        # страницах — так же дёшево на коротком акте, но не пропускает
+        # комментарий в длинном, и не сканирует OCR'ом весь документ,
+        # если комментария в акте нет вовсе.
+        total_pages = len(pdf.pages)
+        comment_min_idx = max(3, total_pages - 8)
+
+        for idx, page in enumerate(pdf.pages):
+            if task_number and comment_text:
+                break
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+            needs_ocr = len(text.strip()) < 30
+            ocr_text = None
+
+            if not task_number:
+                if "заявка" in text.lower() or "на проведение" in text.lower():
+                    task_number = self._match_zayavka_task(text)
+                if not task_number and needs_ocr and idx <= 6:
+                    if pytesseract_module is None:
+                        try:
+                            import pytesseract as pytesseract_module
+                            if not self._configure_tesseract(pytesseract_module):
+                                pytesseract_module = None
+                        except Exception:
+                            pytesseract_module = None
+                    if pytesseract_module is not None:
+                        ocr_text = self._ocr_full_page_text(page, pytesseract_module)
+                        ocr_lower = ocr_text.lower()
+                        if "заявка" in ocr_lower or "на проведение" in ocr_lower:
+                            task_number = self._match_zayavka_task(ocr_text)
+
+            if not comment_text:
+                if "нижеподписавш" in text.lower():
+                    comment_text = self._extract_contractor_comment(text)
+                elif needs_ocr and comment_min_idx <= idx:
+                    if ocr_text is None:
+                        if pytesseract_module is None:
+                            try:
+                                import pytesseract as pytesseract_module
+                                if not self._configure_tesseract(pytesseract_module):
+                                    pytesseract_module = None
+                            except Exception:
+                                pytesseract_module = None
+                        if pytesseract_module is not None:
+                            ocr_text = self._ocr_full_page_text(page, pytesseract_module)
+                    if ocr_text and "нижеподписавш" in ocr_text.lower():
+                        comment_text = self._extract_contractor_comment(ocr_text)
+
+        return task_number, comment_text
 
     def _parse_performed_tasks(self, text: str) -> str:
         """Все задачи, перечисленные в шапке акта ('Задача №54.1', 'Задача
