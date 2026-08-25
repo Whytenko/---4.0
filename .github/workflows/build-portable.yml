@@ -23,7 +23,9 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          # См. build-windows.yml — версия должна совпадать с той, на
+          # которой реально проверяется приложение (3.13).
+          python-version: "3.13"
 
       - name: Linux GUI deps
         if: runner.os == 'Linux'
