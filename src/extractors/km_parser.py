@@ -183,21 +183,43 @@ def compute_km_report(pdf_path: Path) -> dict:
     field = parse_field(text)
     bush = parse_bush(text)
     v1, v3, voff = parse_relocation_values(text)
+    # "Бездорожье" и "3 гр.дорог" в реальных актах — взаимоисключающие
+    # ярлыки ОДНОЙ и той же категории проезда, а не три независимые
+    # категории: ни в одном из 86 реальных актов выборки не встретилось
+    # обеих строк одновременно (только "1 гр"+"3 гр" ИЛИ "1 гр"+
+    # "бездорожье"). Когда акт использует именно "бездорожье" (а "3
+    # гр.дорог" при этом не найдено), число там численно совпадает с
+    # эталонной "3 категории" (напр. акт 12432: бездорожье=11.80,
+    # эталон "3 кат." туда-обратно=11.8) — контрагент так называет ту же
+    # графу. Раньше это число сравнивалось с эталонной "бездорожье"
+    # (часто 0 или другое значение) — отсюда ложные "несхождения".
+    if v3 is None and voff is not None:
+        v3, voff = voff, None
     field, bush, v1, v3, ml_used = _apply_ml_overrides(pdf_path, field, bush, v1, v3)
-    r1, r3, roff = get_report_values(field, bush) if field and bush else (None, None, None)
+    r1_one_way, r3_one_way, roff_one_way = (
+        get_report_values(field, bush) if field and bush else (None, None, None)
+    )
 
-    # Справочник хранит расстояние в одну сторону; в акте фиксируется туда+обратно
-    if r1 is not None:
-        r1 = r1 * 2
-    if r3 is not None:
-        r3 = r3 * 2
-    if roff is not None:
-        roff = roff * 2
+    # Справочник хранит расстояние в одну сторону; в акте обычно
+    # фиксируется туда+обратно — но не всегда: на реальных актах
+    # встречаются случаи (напр. 000083, 12435), где оба значения акта
+    # ТОЧНО совпадают с "одну сторону" эталона, а не с туда-обратно.
+    # Соглашение варьируется от акта к акту, а не общее для всех — и
+    # надёжного признака "какой это акт" нет, поэтому сравниваем с ОБОИМИ
+    # вариантами и принимаем совпадение с любым из них.
+    def _double(value):
+        return value * 2 if value is not None else None
 
-    def _compare(actual, expected):
+    r1 = _double(r1_one_way)
+    r3 = _double(r3_one_way)
+    roff = _double(roff_one_way)
+
+    def _compare(actual, expected, expected_one_way=None):
         if actual is None or expected is None:
             return None
         if abs(actual - expected) <= 0.1:
+            return "ok"
+        if expected_one_way is not None and abs(actual - expected_one_way) <= 0.1:
             return "ok"
         # В акте объём переезда может быть меньше отчётного, если часть
         # маршрута ушла на переезд партии на другой объект (см. 2 лист).
@@ -205,9 +227,9 @@ def compute_km_report(pdf_path: Path) -> dict:
             return "conditional_ok"
         return "bad"
 
-    result1 = _compare(v1, r1)
-    result3 = _compare(v3, r3)
-    result_off = _compare(voff, roff)
+    result1 = _compare(v1, r1, r1_one_way)
+    result3 = _compare(v3, r3, r3_one_way)
+    result_off = _compare(voff, roff, roff_one_way)
     results = (result1, result3, result_off)
 
     if all(r is None for r in results):
