@@ -559,6 +559,20 @@ html = """
             border-color: var(--accent);
             box-shadow: inset 0 0 0 1px var(--accent);
         }
+        .tool-btn.batch-highlight {
+            background: var(--accent);
+            animation: batchBtnPulse 2.4s ease-in-out infinite;
+        }
+        .tool-btn.batch-highlight img {
+            filter: brightness(0) invert(1);
+        }
+        .tool-btn.batch-highlight:hover {
+            transform: translateY(-1px) scale(1.05);
+        }
+        @keyframes batchBtnPulse {
+            0%, 100% { box-shadow: 0 4px 14px rgba(227, 6, 19, 0.35); }
+            50% { box-shadow: 0 4px 20px rgba(227, 6, 19, 0.7); }
+        }
         .tool-btn.start-btn {
             border: 2px solid var(--accent);
             background: transparent;
@@ -1034,7 +1048,7 @@ html = """
                         <img src="__SVG_CHECK__" alt="">
                         <select id="fileSelect"></select>
                     </div>
-                    <button class="tool-btn" data-hint="Нажмите, чтобы загрузить пакет файлов, проверить все и выгрузить Excel-отчёт" onclick="runBatchCheck()" aria-label="Пакетная проверка">
+                    <button class="tool-btn batch-highlight" data-hint="👉 Основной способ проверки: нажмите, чтобы загрузить пакет файлов, проверить все и выгрузить Excel-отчёт" onclick="runBatchCheck()" aria-label="Пакетная проверка (основной способ)">
                         <img src="__SVG_BATCH__" alt="">
                     </button>
                     <button class="tool-btn" data-hint="Нажмите, чтобы открыть папку input" onclick="openFolder()" aria-label="Открыть папку">

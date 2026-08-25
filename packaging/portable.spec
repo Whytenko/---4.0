@@ -24,6 +24,7 @@ if tesseract_dir.exists():
 
 for asset_name in (
     "basket.svg",
+    "batch.svg",
     "check_file.svg",
     "download_file.svg",
     "folder.svg",
