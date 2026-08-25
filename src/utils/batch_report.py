@@ -8,7 +8,6 @@ import pandas as pd
 from openpyxl.utils import get_column_letter
 
 from src.utils.app_paths import ensure_runtime_layout, get_output_dir
-from src.extractors import km_parser, table_parser
 
 STATUS_LABELS = {
     "ok": "✅ OK",
@@ -48,14 +47,15 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
     ensure_runtime_layout(copy_reference=True)
 
     rows = []
-    for pdf_path, well_data in zip(pdf_paths, wells_data):
-        pdf_path = Path(pdf_path)
+    for well_data in wells_data:
+        # temperature/km теперь входят в тот же реестр проверок WellData
+        # (main_parser._check_temperature/_check_km), что и остальные —
+        # единый расчёт что для одиночной проверки акта, что для пакетного
+        # отчёта, вместо отдельного дублирующего вызова table_parser/
+        # km_parser здесь же.
         checks = well_data.get_check_summary()
-        temp_status = table_parser.get_temperature_status(well_data)
-        try:
-            km_status = km_parser.compute_km_report(pdf_path)
-        except Exception:
-            km_status = {"status": "neutral"}
+        temp_status = checks["temperature"]
+        km_status = checks["km"]
 
         statuses = [
             checks["spo"]["status"],

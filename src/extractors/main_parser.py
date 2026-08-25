@@ -153,6 +153,12 @@ class WellData:
     # прибора, осмотр перфоратора и т.д. Появляется не в каждом акте.
     # Для колонки "Комментарии" в реестре "Проверка акт-нарядов".
     contractor_comment: str = ""
+    # Путь к исходному PDF — нужен проверке километража (km_parser заново
+    # открывает файл для доступа к сканам/таблице переездов на стр.1).
+    # Раньше км/температура считались только в пакетном режиме отдельно
+    # от остальных проверок; для показа в одиночной проверке акта
+    # (тот же список, что СПО/расценки/etc.) нужен путь до файла.
+    source_path: str = ""
     # "Всего выполнено" по расценке 348 ("Спуск или подъем скв. прибора
     # через лубр.") из таблицы "Прочие виды работ" на акт-заказе (стр.2) —
     # для сверки с той же расценкой в таблице расценок акт-наряда (стр.1).
@@ -218,6 +224,8 @@ class WellData:
          lambda self: self._prefix_details(self.check_results.get("spo_zakaz", {"status": "neutral"})),
          "СПО: акт-наряд vs акт-заказ", True),
         ("zayavka", lambda self: self._check_zayavka(), "Сверка с заявкой", True),
+        ("temperature", lambda self: self._check_temperature(), "Температура", False),
+        ("km", lambda self: self._check_km(), "Километраж", False),
     )
 
     _STATUS_ICONS: ClassVar[dict] = {"ok": "✅", "bad": "❌"}
@@ -420,6 +428,58 @@ class WellData:
             "status": self.zayavka_check_status,
             "details": [f"    {line}" for line in self.zayavka_check_details],
         }
+
+    def _check_temperature(self) -> dict:
+        """Сверка температуры воздуха в акте со справочником — раньше
+        считалась только в пакетном Excel-отчёте (table_parser.
+        get_temperature_status), отдельно от остальных проверок; здесь —
+        тот же расчёт, чтобы попасть в общий список и при проверке
+        одного акта (кнопка "Пуск"), а не только пакетом."""
+        from src.extractors import table_parser
+
+        result = table_parser.get_temperature_status(self)
+        status = result.get("status", "neutral")
+        if status != "bad":
+            return {"status": status}
+        return {
+            "status": "bad",
+            "details": [
+                f"    в акте {result['pdf_temp']:.1f}°C, по отчёту {result['avg_temp']:.1f}°C "
+                f"(разница {result['diff']:.1f}°C, допуск 5°C)"
+            ],
+        }
+
+    def _check_km(self) -> dict:
+        """Сверка километража (переезды 1/3 гр. дорог, бездорожье) со
+        справочником — раньше считалась только в пакетном Excel-отчёте
+        (km_parser.compute_km_report, заново открывает PDF), здесь —
+        тот же расчёт для единого списка проверок одного акта."""
+        if not self.source_path:
+            return {"status": "neutral"}
+        from pathlib import Path
+        from src.extractors import km_parser
+
+        try:
+            result = km_parser.compute_km_report(Path(self.source_path))
+        except Exception:
+            return {"status": "neutral"}
+        status = result.get("status", "neutral")
+        if status == "conditional_ok":
+            return {"status": "conditional_ok", "value_text": "условно ✅"}
+        if status != "bad":
+            return {"status": status}
+        issues = []
+        for label, actual_key, ref_key, result_key in (
+            ("1 гр.", "v1", "r1", "result1"),
+            ("3 гр.", "v3", "r3", "result3"),
+            ("бездорожье", "voff", "roff", "result_off"),
+        ):
+            if result.get(result_key) == "bad":
+                actual = result.get(actual_key)
+                ref = result.get(ref_key)
+                issues.append(f"{label} акт {actual:.1f} / отчёт {ref:.1f}")
+        detail = "; ".join(issues) if issues else "расхождение с отчётом"
+        return {"status": "bad", "details": [f"    {detail}"]}
 
     @staticmethod
     def _prefix_details(result: dict) -> dict:
@@ -697,6 +757,7 @@ class FinalUnifiedParser:
 
                 well_data = WellData(
                     filename=filename,
+                    source_path=pdf_path,
                     field=self._parse_field(text),
                     order=self._parse_order(text, pdf_path),
                     depth=self._parse_depth(text),
