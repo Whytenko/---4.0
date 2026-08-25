@@ -353,6 +353,15 @@ def _svg_data_uri(name: str) -> str:
     svg = path.read_text(encoding="utf-8")
     return "data:image/svg+xml;utf8," + quote(svg)
 
+
+def _png_data_uri(name: str) -> str:
+    path = Path(__file__).parent / name
+    if not path.exists():
+        return ""
+    import base64
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return "data:image/png;base64," + data
+
 SVG_MAIN = _svg_data_uri("main_parser.svg")
 SVG_TABLE = _svg_data_uri("table_parser.svg")
 SVG_INTEGRAL = _svg_data_uri("integral.svg")
@@ -363,6 +372,10 @@ SVG_CHECK = _svg_data_uri("check_file.svg")
 SVG_LOGO = _svg_data_uri("logo-lu.svg")
 SVG_SKV = _svg_data_uri("skvazhina.svg")
 SVG_BATCH = _svg_data_uri("batch.svg")
+# Юбилейный логотип "35 лет ЛУКОЙЛ" — фон уже удалён (lukoil35-anniversary.png
+# сделан из "35 лет.png", присланного пользователем, порогом по белому цвету),
+# используется только на заставке при старте.
+PNG_ANNIVERSARY35 = _png_data_uri("lukoil35-anniversary.png")
 
 html = """
 <!DOCTYPE html>
@@ -867,6 +880,35 @@ html = """
             font-size: 12px;
             letter-spacing: 0.5px;
         }
+        .splash-anniversary {
+            margin-bottom: 18px;
+            animation: splashPulse 2.2s ease-in-out infinite;
+        }
+        .splash-anniversary img {
+            width: 110px;
+            height: auto;
+            display: block;
+            filter: drop-shadow(0 6px 18px rgba(0, 0, 0, 0.5));
+        }
+        .firework-layer {
+            position: absolute;
+            inset: 0;
+            overflow: hidden;
+            pointer-events: none;
+            z-index: -1;
+        }
+        .firework-particle {
+            position: absolute;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            box-shadow: 0 0 6px 2px currentColor;
+            animation: fireworkBurst 900ms ease-out forwards;
+        }
+        @keyframes fireworkBurst {
+            0% { transform: translate(0, 0) scale(1); opacity: 1; }
+            100% { transform: translate(var(--dx), var(--dy)) scale(0.2); opacity: 0; }
+        }
 
         .batch-progress-overlay {
             position: fixed;
@@ -946,6 +988,10 @@ html = """
 </head>
 <body>
     <div class="splash" id="splashScreen">
+        <div class="firework-layer" id="fireworkLayer"></div>
+        <div class="splash-anniversary">
+            <img src="__PNG_ANNIVERSARY35__" alt="35 лет ЛУКОЙЛ">
+        </div>
         <div class="splash-logo-wrap">
             <img src="__SVG_LOGO__" alt="ЛУКОЙЛ">
         </div>
@@ -1692,10 +1738,49 @@ html = """
         function hideSplash() {
             const splash = document.getElementById('splashScreen');
             if (splash) splash.classList.add('hidden');
+            stopFireworks();
+        }
+
+        let fireworkTimer = null;
+        function spawnFirework() {
+            const layer = document.getElementById('fireworkLayer');
+            if (!layer) return;
+            const colors = ['#ff3b30', '#ffd60a', '#ffffff', '#ff6b6b', '#ffb700'];
+            const x = 12 + Math.random() * 76;
+            const y = 10 + Math.random() * 55;
+            const particleCount = 14;
+            for (let i = 0; i < particleCount; i++) {
+                const p = document.createElement('div');
+                p.className = 'firework-particle';
+                const angle = (i / particleCount) * 2 * Math.PI;
+                const dist = 40 + Math.random() * 40;
+                p.style.setProperty('--dx', (Math.cos(angle) * dist) + 'px');
+                p.style.setProperty('--dy', (Math.sin(angle) * dist) + 'px');
+                p.style.left = x + '%';
+                p.style.top = y + '%';
+                p.style.color = colors[i % colors.length];
+                p.style.background = colors[i % colors.length];
+                layer.appendChild(p);
+                p.addEventListener('animationend', () => p.remove());
+            }
+        }
+        function startFireworks() {
+            if (fireworkTimer) return;
+            spawnFirework();
+            fireworkTimer = setInterval(spawnFirework, 700);
+        }
+        function stopFireworks() {
+            if (fireworkTimer) {
+                clearInterval(fireworkTimer);
+                fireworkTimer = null;
+            }
+            const layer = document.getElementById('fireworkLayer');
+            if (layer) layer.innerHTML = '';
         }
 
         // Загружаем файлы при старте
         async function initApp() {
+            startFireworks();
             const splashStart = Date.now();
             const splashStatus = document.getElementById('splashStatus');
             const setSplashStatus = (text) => { if (splashStatus) splashStatus.textContent = text; };
@@ -1741,6 +1826,7 @@ html = html.replace("__SVG_CHECK__", SVG_CHECK)
 html = html.replace("__SVG_LOGO__", SVG_LOGO)
 html = html.replace("__SVG_SKV__", SVG_SKV)
 html = html.replace("__SVG_BATCH__", SVG_BATCH)
+html = html.replace("__PNG_ANNIVERSARY35__", PNG_ANNIVERSARY35)
 
 
 def _run_cli_mode(argv):

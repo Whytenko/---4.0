@@ -35,6 +35,7 @@ for asset_name in (
     "lukoil-desk.ico",
     "lukoil35.ico",
     "lukoil35.webp",
+    "lukoil35-anniversary.png",
     "main_parser.svg",
     "skvazhina.svg",
     "table_parser.svg",
