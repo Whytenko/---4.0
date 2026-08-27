@@ -1,43 +1,36 @@
 Sub AppendToMasterRegistry()
-    ' Это отдельный, неизменяемый файл-лаунчер (не наш сгенерированный
-    ' отчёт!) — Python-код его больше не трогает, поэтому просим выбрать
-    ' ОБА файла: сначала отчёт-источник ("Реестр"), потом реестр-назначение.
+    ' Кнопка живёт прямо в мастер-реестре (напр. "Проверка акт-нарядов
+    ' 2026.xlsx") — ThisWorkbook и есть реестр, поэтому спрашиваем только
+    ' файл-источник (свежий отчёт), а пишем сразу в тот же лист, где кнопка.
     Dim reportPath As Variant
     reportPath = Application.GetOpenFilename( _
         "Excel Files (*.xlsx;*.xlsm),*.xlsx;*.xlsm", , _
-        "Шаг 1 из 2 — выберите файл ОТЧЁТА (Отчет по пакету актов ....xlsx)")
+        "Выберите файл отчёта (Отчет по пакету актов ....xlsx)")
     If VarType(reportPath) = vbBoolean Then Exit Sub
 
-    Dim masterPath As Variant
-    masterPath = Application.GetOpenFilename( _
-        "Excel Files (*.xlsx;*.xlsm),*.xlsx;*.xlsm", , _
-        "Шаг 2 из 2 — выберите файл РЕЕСТРА (например, Проверка акт-нарядов 2026.xlsx)")
-    If VarType(masterPath) = vbBoolean Then Exit Sub
-
-    Dim reportWb As Workbook, masterWb As Workbook
+    Dim srcWb As Workbook
     Dim wbLoop As Workbook
-    Dim wasReportOpen As Boolean, wasMasterOpen As Boolean
-
-    wasReportOpen = False
+    Dim wasSrcOpen As Boolean
+    wasSrcOpen = False
     For Each wbLoop In Workbooks
         If StrComp(wbLoop.FullName, CStr(reportPath), vbTextCompare) = 0 Then
-            Set reportWb = wbLoop
-            wasReportOpen = True
+            Set srcWb = wbLoop
+            wasSrcOpen = True
             Exit For
         End If
     Next wbLoop
-    If Not wasReportOpen Then
+    If Not wasSrcOpen Then
         Application.ScreenUpdating = False
-        Set reportWb = Workbooks.Open(CStr(reportPath))
+        Set srcWb = Workbooks.Open(CStr(reportPath))
     End If
 
     Dim srcWs As Worksheet
     On Error Resume Next
-    Set srcWs = reportWb.Sheets("Реестр")
+    Set srcWs = srcWb.Sheets("Реестр")
     On Error GoTo 0
     If srcWs Is Nothing Then
         MsgBox "В выбранном файле отчёта нет листа ""Реестр"".", vbExclamation
-        If Not wasReportOpen Then reportWb.Close SaveChanges:=False
+        If Not wasSrcOpen Then srcWb.Close SaveChanges:=False
         Application.ScreenUpdating = True
         Exit Sub
     End If
@@ -46,25 +39,13 @@ Sub AppendToMasterRegistry()
     lastRowSrc = srcWs.Cells(srcWs.Rows.Count, 1).End(xlUp).Row
     If lastRowSrc < 2 Then
         MsgBox "В листе ""Реестр"" нет строк для переноса.", vbExclamation
-        If Not wasReportOpen Then reportWb.Close SaveChanges:=False
+        If Not wasSrcOpen Then srcWb.Close SaveChanges:=False
         Application.ScreenUpdating = True
         Exit Sub
     End If
 
-    wasMasterOpen = False
-    For Each wbLoop In Workbooks
-        If StrComp(wbLoop.FullName, CStr(masterPath), vbTextCompare) = 0 Then
-            Set masterWb = wbLoop
-            wasMasterOpen = True
-            Exit For
-        End If
-    Next wbLoop
-    If Not wasMasterOpen Then
-        Set masterWb = Workbooks.Open(CStr(masterPath))
-    End If
-
     Dim destWs As Worksheet
-    Set destWs = masterWb.Sheets(1)
+    Set destWs = ThisWorkbook.Sheets(1)
 
     Dim lastRowDest As Long
     lastRowDest = destWs.Cells(destWs.Rows.Count, 1).End(xlUp).Row
@@ -106,21 +87,12 @@ Sub AppendToMasterRegistry()
         destRow = destRow + 1
     Next srcRow
 
-    masterWb.Save
-
-    ' Отчёт-источник закрываем без сохранения — мы его только читали.
-    If Not wasReportOpen Then reportWb.Close SaveChanges:=False
+    If Not wasSrcOpen Then srcWb.Close SaveChanges:=False
     Application.ScreenUpdating = True
+
+    ThisWorkbook.Save
 
     Dim addedCount As Long
     addedCount = lastRowSrc - 1
-
-    Dim msg As String
-    msg = "Готово: добавлено строк " & addedCount & " в файл реестра:" & vbCrLf & CStr(masterPath)
-    If wasMasterOpen Then
-        msg = msg & vbCrLf & vbCrLf & "(книга реестра была уже открыта — сохранена как есть)"
-    Else
-        masterWb.Close SaveChanges:=False
-    End If
-    MsgBox msg, vbInformation
+    MsgBox "Готово: добавлено строк " & addedCount & ".", vbInformation
 End Sub
