@@ -1440,9 +1440,14 @@ class FinalUnifiedParser:
     # ===== ОСНОВНЫЕ ДАННЫЕ =====
     
     def _parse_field(self, text: str) -> str:
-        """Месторождение"""
-        match = re.search(r'Месторождение[^А-Я]*([А-Я][а-я]+ское|[А-Я][а-я]+ное)', text)
-        return match.group(1) if match else "не найдено"
+        """Месторождение — общая с km_parser.parse_field логика (та же
+        сверка со справочником по километражу, где эти 10 названий полей
+        и берутся), иначе простые и составные (через дефис) названия
+        полей заново разъезжались бы по двум местам, как уже бывало."""
+        from src.extractors import km_parser
+
+        field = km_parser.parse_field(text)
+        return field if field else "не найдено"
     
     def _parse_order(self, text: str, pdf_path: str) -> str:
         """Номер заказа"""
