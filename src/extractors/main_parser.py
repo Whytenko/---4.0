@@ -453,7 +453,12 @@ class WellData:
         """Сверка километража (переезды 1/3 гр. дорог, бездорожье) со
         справочником — раньше считалась только в пакетном Excel-отчёте
         (km_parser.compute_km_report, заново открывает PDF), здесь —
-        тот же расчёт для единого списка проверок одного акта."""
+        тот же расчёт для единого списка проверок одного акта.
+
+        Подробности (куст, акт/отчёт по каждой категории) выводим ВСЕГДА,
+        а не только при расхождении — иначе статус "✅" без единой цифры
+        не даёт понять, что вообще сверялось и с каким значением
+        справочника совпало."""
         if not self.source_path:
             return {"status": "neutral"}
         from pathlib import Path
@@ -464,22 +469,14 @@ class WellData:
         except Exception:
             return {"status": "neutral"}
         status = result.get("status", "neutral")
+        if status == "neutral":
+            return {"status": "neutral"}
+
+        lines = [f"    {line}" for line in km_parser.format_km_details(result)]
         if status == "conditional_ok":
-            return {"status": "conditional_ok", "value_text": "условно ✅"}
-        if status != "bad":
-            return {"status": status}
-        issues = []
-        for label, actual_key, ref_key, result_key in (
-            ("1 гр.", "v1", "r1", "result1"),
-            ("3 гр.", "v3", "r3", "result3"),
-            ("бездорожье", "voff", "roff", "result_off"),
-        ):
-            if result.get(result_key) == "bad":
-                actual = result.get(actual_key)
-                ref = result.get(ref_key)
-                issues.append(f"{label} акт {actual:.1f} / отчёт {ref:.1f}")
-        detail = "; ".join(issues) if issues else "расхождение с отчётом"
-        return {"status": "bad", "details": [f"    {detail}"]}
+            lines.append("    Переезд на другой объект — см. отметку на акт-заказе (стр.2)")
+            return {"status": "conditional_ok", "value_text": "условно ✅", "details": lines}
+        return {"status": status, "details": lines}
 
     @staticmethod
     def _prefix_details(result: dict) -> dict:
@@ -602,6 +599,40 @@ class WellData:
         if flagged:
             return {"status": "bad", "details": flagged}
         return {"status": "ok", "details": [f"В норме (≤{threshold_hours:.0f} ч), строк проверено: {checked}"]}
+
+    def _tech_duty_hours_from_rows(self, rows: List[dict]) -> float | None:
+        """Часы тех.дежурства из уже надёжно распознанных строк расценок
+        (не OCR) — реальные акты сокращают название по-разному ("Тех.деж-
+        во", "Тех.дежурство", "Технологическое дежурство"), поэтому ищем
+        "тех" и "деж" рядом, а не точную фразу целиком."""
+        total = 0.0
+        found = False
+        for row in rows:
+            norm = str(row.get("name", "")).strip().lower()
+            if not re.search(r'тех[а-я]*\.?\s*деж', norm):
+                continue
+            volume = row.get("volume")
+            if isinstance(volume, (int, float)) and volume > 0:
+                total += volume
+                found = True
+        return total if found else None
+
+    def _finalize_contractor_comment(self, rows: List[dict]) -> None:
+        """Итоговый комментарий в духе колонки "Комментарии" реестра
+        заказчика: там почти всегда либо "+" (замечаний нет — большинство
+        строк), либо короткий факт вида "Тех.деж. 4ч." или "Стоянка на
+        глубине 2330 м.", а не абзац текста целиком. Часы тех.дежурства
+        берём из строк расценок (надёжнее, чем распознавание акта о
+        простое по OCR) и добавляем к уже найденному нарративному факту
+        (стоянка/иное), если он есть."""
+        hours = self._tech_duty_hours_from_rows(rows)
+        parts = []
+        if hours:
+            hours_str = str(int(hours)) if hours == int(hours) else f"{hours:.2f}".rstrip("0").rstrip(".")
+            parts.append(f"Тех.деж. {hours_str}ч.")
+        if self.contractor_comment:
+            parts.append(self.contractor_comment)
+        self.contractor_comment = " ".join(parts) if parts else "+"
 
     def _check_thermometry_overlap(self, rows: List[dict]) -> dict:
         scale_re = re.compile(r'термометри.*?[MМ]\s*1\s*:\s*(200|500)', re.IGNORECASE)
@@ -812,6 +843,7 @@ class FinalUnifiedParser:
                 well_data.check_results["thermometry_overlap"] = well_data._check_thermometry_overlap(rate_rows)
                 well_data.check_results["interval_length"] = well_data._check_interval_length(rate_rows)
                 well_data.check_results["spo_zakaz"] = well_data._check_spo_zakaz(rate_rows)
+                well_data._finalize_contractor_comment(rate_rows)
 
                 if well_data.start_date == "не найдено" or well_data.end_date == "не найдено":
                     start_ocr, end_ocr = self._parse_page1_dates_ocr(pdf, header_idx)
@@ -1468,6 +1500,23 @@ class FinalUnifiedParser:
                 return match.group(1)
         return ""
 
+    # Короткие, самодостаточные факты внутри длинного текста страницы
+    # "АКТ" — извлекаем ИХ, а не весь абзац целиком (реестр заказчика на
+    # 2696 реальных строках показывает: 37% комментариев — это просто "+"
+    # (замечаний нет), ~41% — короткое "Тех.деж. N ч.", ~5% — короткое
+    # "Стоянка на гл. N м", и лишь остаток — действительно свободный текст).
+    _COMMENT_STOYANKA_RE: ClassVar = re.compile(
+        r'сто[яй]нк[а-я]*(?:\s+(?:прибора|шаблона|магнита)[а-я]*)?'
+        r'(?:[^.]{0,40}?(?:на\s+)?гл(?:убине)?\.?)?[^.]{0,25}?'
+        r'[\d][\d\s,.]*\s*м(?:етр[а-я]*)?\b[^.]{0,60}',
+        re.IGNORECASE,
+    )
+    _COMMENT_TECH_DUTY_RE: ClassVar = re.compile(
+        r'тех[а-я]*\.?\s*деж[а-я]*[^.]{0,80}?составил[оа][^.]{0,25}?'
+        r'(\d+[.,]?\d*)[^.]{0,20}?час',
+        re.IGNORECASE,
+    )
+
     def _extract_contractor_comment(self, text: str) -> str:
         """Текст свободного комментария подрядчика со страницы вида
         "ПАО «КОГАЛЫМНЕФТЕГЕОФИЗИКА» / АКТ / Мы, нижеподписавшиеся: ...
@@ -1477,7 +1526,25 @@ class FinalUnifiedParser:
         извлечения и т.д.), в отличие от рутинного "АКТ проверки готовности
         скважины" (у него тоже есть "нижеподписавшиеся", но сразу за
         "составили настоящий акт" идёт неизменное "о том, что нами
-        проверена готовность" — исключаем именно эту формулировку)."""
+        проверена готовность" — исключаем именно эту формулировку).
+
+        Из найденной страницы вырезаем КОРОТКИЙ ключевой факт (стоянка на
+        такой-то глубине, тех.дежурство составило N часов), а не абзац
+        целиком — так короче и ближе к тому, как реально заполняется
+        колонка "Комментарии" в реестре заказчика.
+
+        Два часто встречающихся варианта такой страницы — "опрессовка
+        устьевого оборудования" и "осмотр перфоратора после извлечения
+        из скважины" — в реестре заказчика ПРАКТИЧЕСКИ ВСЕГДА дают "+"
+        (проверено: 0 из 2696 реальных комментариев содержат "опресс";
+        "осмотр перфоратора" типично заканчивается штатным "без явных
+        повреждений... претензий нет"). Поэтому если это рутинное
+        подтверждение без явной аномалии — не отдаём его как комментарий,
+        пусть выше по стеку сработает дефолт "+". Если найдётся явная
+        аномалия (повреждение/отказ/брак) — короткий факт всё равно не
+        нашёлся бы регэкспами выше, так что отдаём усечённую выдержку как
+        запасной вариант — лучше короткая зацепка для человека, чем "+"
+        при реальной проблеме."""
         match = re.search(r'составили\s+настоящий\s+[Аа]кт', text, re.IGNORECASE)
         if not match:
             return ""
@@ -1486,7 +1553,32 @@ class FinalUnifiedParser:
             return ""
         body = text[match.start():].strip()
         body = re.sub(r'\s+', ' ', body)
-        return body[:1200]
+
+        tech_duty_match = self._COMMENT_TECH_DUTY_RE.search(body)
+        stoyanka_match = self._COMMENT_STOYANKA_RE.search(body)
+        facts = []
+        if stoyanka_match:
+            facts.append(re.sub(r'\s+', ' ', stoyanka_match.group()).strip(" ,;"))
+        if tech_duty_match:
+            hours = tech_duty_match.group(1).replace(",", ".")
+            facts.append(f"Тех.деж. {hours}ч.")
+        if facts:
+            return " ".join(facts)
+
+        # Именно ПОЛОЖИТЕЛЬНАЯ формулировка обнаруженной проблемы, а не
+        # голый корень "поврежд" — иначе штатное "не имеют явных
+        # повреждений" (то есть повреждений НЕТ) ложно считается аномалией
+        # и рутинный акт осмотра перфоратора не сворачивается в "+".
+        has_anomaly = re.search(
+            r'обнаружил[аои]?\s+(?:следующ\w*\s+)?(?:повреждени|дефект)|'
+            r'имеются?\s+повреждени|отказ(?:ал)?|брак(?:ован)?|не\s+сработал|негерметичн',
+            body, re.IGNORECASE,
+        )
+        if not has_anomaly and re.search(r'опрессов', body, re.IGNORECASE):
+            return ""
+        if not has_anomaly and re.search(r'осмотр(?:ели)?\s+перфоратор', body, re.IGNORECASE):
+            return ""
+        return body[:300]
 
     def _ocr_full_page_text(self, page, pytesseract_module) -> str:
         try:

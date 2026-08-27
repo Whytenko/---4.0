@@ -24,6 +24,18 @@ def _label(status: str) -> str:
     return STATUS_LABELS.get(status, "— нет данных")
 
 
+def _label_km(km_status: dict) -> str:
+    """Как _label(), но с подробностями (акт/отчёт по каждой категории
+    переезда) — иначе ячейка "✅ OK" не даёт понять, какие именно цифры
+    сверялись и с каким значением справочника совпали."""
+    label = _label(km_status.get("status"))
+    details = km_status.get("details") or []
+    if not details:
+        return label
+    compact = "; ".join(line.strip() for line in details)
+    return f"{label}: {compact}"
+
+
 def _row_overall(statuses: List[str]) -> str:
     if any(status == "bad" for status in statuses):
         return "❌ ЕСТЬ РАСХОЖДЕНИЯ"
@@ -101,7 +113,7 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
                 "СПО (акт-наряд vs акт-заказ)": _label(checks["spo_zakaz"]["status"]),
                 "Сверка с заявкой": _label(checks["zayavka"]["status"]),
                 "Температура": _label(temp_status["status"]),
-                "Километраж": _label(km_status["status"]),
+                "Километраж": _label_km(km_status),
                 "ИТОГ": _row_overall(statuses),
             }
         )

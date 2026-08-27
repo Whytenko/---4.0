@@ -50,31 +50,24 @@ def _format_temperature_line(well_data) -> str:
 
 
 def _format_km_line(pdf_path: Path) -> str:
-    """Компактная строка по километражу: '+' если всё сошлось, иначе —
-    какая именно категория (1 гр./3 гр./бездорожье) разошлась и на сколько."""
+    """Компактная строка по километражу: куст + акт/отчёт по каждой
+    сверенной категории (1 гр./3 гр./бездорожье), не просто '+'/'❌' без
+    единой цифры — та же логика, что и в одиночной проверке акта
+    (main_parser._check_km), через общий km_parser.format_km_details."""
     from src.extractors import km_parser
 
     result = km_parser.compute_km_report(pdf_path)
     status = result.get("status")
-    if status == "ok":
-        return "Километраж: +"
     if status == "neutral":
         return "Километраж: нет данных для сверки"
-    if status == "conditional_ok":
-        return "Километраж: + (меньше нормы, но есть отметка о переезде на другой объект)"
 
-    issues = []
-    for label, actual_key, ref_key, result_key in (
-        ("1 гр.", "v1", "r1", "result1"),
-        ("3 гр.", "v3", "r3", "result3"),
-        ("бездорожье", "voff", "roff", "result_off"),
-    ):
-        if result.get(result_key) == "bad":
-            actual = result.get(actual_key)
-            ref = result.get(ref_key)
-            issues.append(f"{label} акт {actual:.1f} / отчёт {ref:.1f}")
-    detail = "; ".join(issues) if issues else "расхождение с отчётом"
-    return f"Километраж: ❌ {detail}"
+    details = km_parser.format_km_details(result)
+    compact = "; ".join(details) if details else "нет данных для сверки"
+    if status == "conditional_ok":
+        return f"Километраж: + (усл., переезд на др. объект) — {compact}"
+    if status == "bad":
+        return f"Километраж: ❌ {compact}"
+    return f"Километраж: + — {compact}"
 
 
 def run_batch_pipeline(pdf_paths: List[Path], progress_callback=None) -> BatchResult:

@@ -243,6 +243,7 @@ def compute_km_report(pdf_path: Path) -> dict:
 
     return {
         "status": overall,
+        "field": field,
         "bush": bush,
         "v1": v1,
         "v3": v3,
@@ -250,11 +251,52 @@ def compute_km_report(pdf_path: Path) -> dict:
         "r1": r1,
         "r3": r3,
         "roff": roff,
+        "r1_one_way": r1_one_way,
+        "r3_one_way": r3_one_way,
+        "roff_one_way": roff_one_way,
         "result1": result1,
         "result3": result3,
         "result_off": result_off,
         "relocation_note": relocation_note,
     }
+
+
+def format_km_details(result: dict) -> list:
+    """Короткие человекочитаемые строки "куст"/"акт X / отчёт Y" по
+    каждой сверенной категории переезда — общая логика для одиночной
+    проверки акта (main_parser._check_km) и пакетного отчёта
+    (batch_pipeline/batch_report), чтобы они не разошлись по формату,
+    как уже не раз случалось с другими списками проверок в этом проекте."""
+    lines = []
+    if result.get("bush"):
+        lines.append(f"Куст: {result['bush']}")
+    icons = {"ok": "✅", "conditional_ok": "✅", "bad": "❌"}
+    for label, actual_key, ref_key, one_way_key, result_key in (
+        ("1 гр.", "v1", "r1", "r1_one_way", "result1"),
+        ("3 гр.", "v3", "r3", "r3_one_way", "result3"),
+        ("бездорожье", "voff", "roff", "roff_one_way", "result_off"),
+    ):
+        res = result.get(result_key)
+        if res is None:
+            continue
+        actual = result.get(actual_key)
+        ref = result.get(ref_key)
+        one_way = result.get(one_way_key)
+        # Показываем именно то значение справочника, с которым акт
+        # реально совпал (туда-обратно или в один конец) — иначе при
+        # совпадении "в один конец" рядом со статусом ✅ виднелось бы
+        # ровно вдвое большее число, будто акт не сошёлся.
+        matched_ref = ref
+        if (
+            ref is not None and actual is not None and abs(actual - ref) > 0.1
+            and one_way is not None and abs(actual - one_way) <= 0.1
+        ):
+            matched_ref = one_way
+        if actual is None or matched_ref is None:
+            continue
+        icon = icons.get(res, "")
+        lines.append(f"{icon} {label}: акт {actual:.1f} / отчёт {matched_ref:.1f}")
+    return lines
 
 
 def process_pdf(pdf_path: Path):
