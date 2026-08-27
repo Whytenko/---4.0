@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List
 
 import pandas as pd
+from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 
 from src.utils.app_paths import ensure_runtime_layout, get_output_dir
@@ -15,6 +16,26 @@ STATUS_LABELS = {
     "bad": "❌ Расхождение",
     "neutral": "— нет данных",
 }
+
+# Заливка ячейки по первому символу текста ("✅ OK", "❌ Расхождение",
+# "⚠️ МАЛО ДАННЫХ...", "— нет данных") — иконка в тексте легко теряется
+# при беглом просмотре десятков строк и колонок, а цвет фона виден сразу.
+_FILL_BY_PREFIX = (
+    ("❌", PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")),
+    ("✅", PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")),
+    ("⚠️", PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")),
+    ("—", PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")),
+)
+
+
+def _apply_status_fills(worksheet, df: pd.DataFrame) -> None:
+    for row_idx, row in enumerate(df.itertuples(index=False), start=2):
+        for col_idx, value in enumerate(row, start=1):
+            text = str(value)
+            for prefix, fill in _FILL_BY_PREFIX:
+                if text.startswith(prefix):
+                    worksheet.cell(row=row_idx, column=col_idx).fill = fill
+                    break
 
 # Статусы, которые считаются "пройдено" при подсчёте общего итога по акту.
 _PASSING_STATUSES = {"ok", "conditional_ok"}
@@ -132,6 +153,7 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
 
         df.to_excel(writer, index=False, sheet_name="Сводка")
         _autosize_columns(writer.sheets["Сводка"], df)
+        _apply_status_fills(writer.sheets["Сводка"], df)
 
     return report_path
 
