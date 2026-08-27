@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import List
 
+import openpyxl
 import pandas as pd
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 
-from src.utils.app_paths import ensure_runtime_layout, get_output_dir
+from src.utils.app_paths import ensure_runtime_layout, get_bundled_templates_dir, get_output_dir
+
+# Шаблон с кнопкой-макросом "Перенести в реестр заказчика" (см.
+# packaging/excel_macro/README.md) — готовится один раз вручную в
+# настоящем Excel, т.к. запрограммировать создание VBA-проекта отсюда
+# нельзя (COM-автоматизация Excel.Application на машинах разработки и
+# части ПК пользователей перехвачена WPS Office, которая блокирует
+# программное создание макросов). Если файла ещё нет — отчёт как и
+# раньше строится обычным .xlsx без кнопки, без ошибок.
+_TEMPLATE_NAME = "batch_report_template.xlsm"
 
 STATUS_LABELS = {
     "ok": "✅ OK",
@@ -145,8 +156,24 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
     output_dir = get_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    report_path = output_dir / f"Отчет по пакету актов {timestamp}.xlsx"
 
+    template_path = get_bundled_templates_dir() / _TEMPLATE_NAME
+    if template_path.exists():
+        report_path = output_dir / f"Отчет по пакету актов {timestamp}.xlsm"
+        shutil.copy2(template_path, report_path)
+
+        wb = openpyxl.load_workbook(report_path, keep_vba=True)
+        _write_dataframe(wb["Реестр"], registry_df)
+        _autosize_columns(wb["Реестр"], registry_df)
+
+        _write_dataframe(wb["Сводка"], df)
+        _autosize_columns(wb["Сводка"], df)
+        _apply_status_fills(wb["Сводка"], df)
+
+        wb.save(report_path)
+        return report_path
+
+    report_path = output_dir / f"Отчет по пакету актов {timestamp}.xlsx"
     with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
         registry_df.to_excel(writer, index=False, sheet_name="Реестр")
         _autosize_columns(writer.sheets["Реестр"], registry_df)
@@ -156,6 +183,18 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
         _apply_status_fills(writer.sheets["Сводка"], df)
 
     return report_path
+
+
+def _write_dataframe(worksheet, df: pd.DataFrame) -> None:
+    """Как df.to_excel(), но через openpyxl на уже существующий лист
+    шаблона (.xlsm) — только значения ячеек, не трогая лежащие на том же
+    листе объекты (кнопку-макрос), которые pandas.to_excel просто
+    уничтожил бы, пересоздав лист с нуля."""
+    if worksheet.max_row:
+        worksheet.delete_rows(1, worksheet.max_row)
+    worksheet.append(list(df.columns))
+    for row in df.itertuples(index=False):
+        worksheet.append(list(row))
 
 
 def _autosize_columns(worksheet, df: pd.DataFrame) -> None:

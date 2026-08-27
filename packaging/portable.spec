@@ -11,6 +11,14 @@ datas = [
     (str(project_root / "MLdata(Лист1)-2.csv"), "."),
 ]
 
+# Шаблон пакетного Excel-отчёта с кнопкой-макросом (см.
+# packaging/excel_macro/README.md) — необязателен: если папки/файла нет
+# (шаблон ещё не подготовлен), batch_report.py сам падает обратно на
+# обычный .xlsx без кнопки, ничего не ломая.
+templates_dir = project_root / "data" / "templates"
+if templates_dir.exists():
+    datas.append((str(templates_dir), "data/templates"))
+
 # webview хранит JS-мост (js/api.js и др.) и нативные WebView2 DLL
 # (WebView2Loader.dll, WebBrowserInterop.x64.dll и т.д.) как файлы данных
 # пакета, а не Python-модули — collect_submodules их не подхватывает.
