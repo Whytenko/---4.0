@@ -90,14 +90,6 @@ def get_bundled_input_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "data" / "input"
 
 
-def get_bundled_templates_dir() -> Path:
-    for root in get_resource_roots():
-        candidate = root / "data" / "templates"
-        if candidate.exists():
-            return candidate
-    return Path(__file__).resolve().parents[2] / "data" / "templates"
-
-
 def get_bundled_ml_data_csv() -> Path:
     filename = "MLdata(Лист1)-2.csv"
     for root in get_resource_roots():
