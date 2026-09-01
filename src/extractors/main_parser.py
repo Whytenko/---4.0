@@ -1636,6 +1636,72 @@ class FinalUnifiedParser:
             return "⚠ см. акт: " + body[:150]
         return ""
 
+    # Страница "ИНДИВИДУАЛЬНЫЙ ТЕХНИЧЕСКИЙ ПРОЕКТ (ПЛАН) НА ПРОИЗВОДСТВО ПВР"
+    # (появляется у задач с перфорацией, напр. №58) — интервал перфорации на
+    # одной странице, "Данные о прострелочно-взрывной аппаратуре (ПВА)" с
+    # типом заряда/плотностью/объёмом работ обычно на следующей. Номер
+    # пункта (18/19/20...) у разных актов сдвинут на 1 (лишняя вставленная
+    # строка выше) — ищем по тексту метки, не по номеру. OCR этой страницы
+    # шумный (реальные примеры: "Тип ПК:" вместо "Тип ПВА", встроенная
+    # опечатка "СКОРПИОН. -89(К)", "Объем работ зарядов. 250" — число
+    # ПОСЛЕ слова вместо перед ним), поэтому регэкспы намеренно нежёсткие.
+    _ITP_INTERVAL_RE: ClassVar = re.compile(
+        r'перфорация\s+в\s+интервале\s*:?\s*_*([^\n]+)', re.IGNORECASE
+    )
+    _ITP_CHARGE_RE: ClassVar = re.compile(
+        # "Tun" — частая OCR-ошибка распознавания "Тип" латиницей (акт
+        # 000086: "18. Tun ПВА Скорпнон-102 (К). Тип заряда: ..."), та же
+        # путаница алфавитов, что и "тех"/"tex" в комментариях подрядчика.
+        r'\b(?:Тип|Tun)\s+([^\n]+?)\s*Тип\s*заряда\s*[.:;]*\s*_*([^\n(]+?)_*\s*[.(\n]',
+        re.IGNORECASE,
+    )
+    _ITP_DENSITY_RE: ClassVar = re.compile(
+        r'Плотность\s+снаряжения\s+ПВА[.,]?\s*_*([\d][\d+\s]*?)\.?\s*отв', re.IGNORECASE
+    )
+    _ITP_VOLUME_RE: ClassVar = re.compile(r'Объем\s+работ\s+(\d+)\s*заряд', re.IGNORECASE)
+    _ITP_VOLUME_REVERSED_RE: ClassVar = re.compile(
+        r'Объем\s+работ\s+заряд[а-я]*\.?\s*(\d+)', re.IGNORECASE
+    )
+
+    def _format_perforation_spec(self, buffer: str) -> str:
+        """Короткая сводка по перфорации из buffer (объединённый текст
+        нескольких соседних страниц ИТП/ПВР) — интервал, тип заряда,
+        плотность снаряжения ПВА, объём работ (кол-во зарядов). Требуем
+        заряд+плотность+объём вместе — если хоть одно не нашлось, страница
+        либо не та, либо слишком шумная, чтобы доверять частичному
+        результату; отдаём "", а не половину факта."""
+        charge_match = self._ITP_CHARGE_RE.search(buffer)
+        density_match = self._ITP_DENSITY_RE.search(buffer)
+        volume_match = self._ITP_VOLUME_RE.search(buffer) or self._ITP_VOLUME_REVERSED_RE.search(buffer)
+        if not (charge_match and density_match and volume_match):
+            return ""
+
+        perf_type = re.sub(
+            r'^(ПВА|ПК)\b[.:]?\s*_*', "", charge_match.group(1).strip(), flags=re.IGNORECASE
+        ).strip(" _.")
+        charge_type = charge_match.group(2).strip(" _.")
+        # Схлопываем внутренние пробелы до одного, а не убираем совсем —
+        # иначе шумное OCR-значение "20 10+10" превращается в "2010+10"
+        # (выглядит как одно 4-значное число вместо явного шума).
+        density = re.sub(r'\s+', " ", density_match.group(1).strip(" _"))
+        volume = volume_match.group(1)
+
+        interval_match = self._ITP_INTERVAL_RE.search(buffer)
+        interval = interval_match.group(1).strip(" _.") if interval_match else ""
+
+        equip_bits = []
+        if perf_type:
+            equip_bits.append(f"перфоратор {perf_type}")
+        equip_bits.append(f"заряд {charge_type}")
+        equip_bits.append(f"плотность {density} отв/м")
+        equip_bits.append(f"кол-во {volume} зарядов")
+        equip_bits[0] = equip_bits[0][0].upper() + equip_bits[0][1:]
+        equip_part = ", ".join(equip_bits) + "."
+
+        if interval:
+            return f"Перфорация в интервале {interval}. {equip_part}"
+        return equip_part
+
     def _ocr_full_page_text(self, page, pytesseract_module) -> str:
         try:
             from PIL import ImageOps
@@ -1649,27 +1715,30 @@ class FinalUnifiedParser:
     def _parse_zayavka_and_comment(self, pdf) -> tuple[str, str]:
         """Один проход по страницам акта — номер задачи из встроенной
         ЗАЯВКИ (лист "ЗАЯВКА на проведение промыслово-геофизических
-        исследований скважин", обычно 4-й) и текст комментария подрядчика
-        (страница "АКТ" с "нижеподписавшиеся"), оба поля — с OCR-фоллбэком:
-        на реальных актах обе страницы чаще скан, чем цифровой текст (по
-        выборке 86 актов OCR потребовался для заявки в ~65 из 82 найденных
-        случаев). Общий проход экономит OCR — не открываем те же страницы
-        дважды под каждое поле по отдельности."""
+        исследований скважин", обычно 4-й), текст комментария подрядчика
+        (страница "АКТ" с "нижеподписавшиеся") и, если есть, спецификация
+        перфорации со страницы "ИНДИВИДУАЛЬНЫЙ ТЕХНИЧЕСКИЙ ПРОЕКТ (ПЛАН)
+        НА ПРОИЗВОДСТВО ПВР" (задачи с перфорацией, напр. №58) — все три
+        поля с OCR-фоллбэком: на реальных актах эти страницы чаще скан,
+        чем цифровой текст. Общий проход экономит OCR — не открываем те
+        же страницы дважды под каждое поле по отдельности."""
         task_number = ""
         comment_text = ""
+        itp_result = ""
+        itp_buffer = ""
         pytesseract_module = None
-        # Комментарий подрядчика — почти всегда на последних листах пакета
-        # (после Справки по зарегистрированному материалу, ближе к концу),
-        # а не на фиксированном номере страницы: сами акты разной длины
-        # (от 7 до 16+ листов среди реальных актов). Ищем в последних 8
-        # страницах — так же дёшево на коротком акте, но не пропускает
-        # комментарий в длинном, и не сканирует OCR'ом весь документ,
-        # если комментария в акте нет вовсе.
+        # Комментарий подрядчика и спецификация перфорации — почти всегда
+        # на последних листах пакета (после Справки по зарегистрированному
+        # материалу, ближе к концу), а не на фиксированном номере страницы:
+        # сами акты разной длины (от 7 до 16+ листов среди реальных актов).
+        # Ищем в последних 8 страницах — так же дёшево на коротком акте, но
+        # не пропускает поле в длинном, и не сканирует OCR'ом весь документ,
+        # если ни того, ни другого в акте нет вовсе.
         total_pages = len(pdf.pages)
         comment_min_idx = max(3, total_pages - 8)
 
         for idx, page in enumerate(pdf.pages):
-            if task_number and comment_text:
+            if task_number and comment_text and itp_result:
                 break
             try:
                 text = page.extract_text() or ""
@@ -1695,23 +1764,38 @@ class FinalUnifiedParser:
                         if "заявка" in ocr_lower or "на проведение" in ocr_lower:
                             task_number = self._match_zayavka_task(ocr_text)
 
+            # Комментарий и спецификация перфорации ищутся в одном и том
+            # же "хвосте" документа — если нужен OCR, считаем его один раз
+            # и переиспользуем для обоих полей, а не гоняем OCR отдельно
+            # под каждое.
+            if needs_ocr and comment_min_idx <= idx and (not comment_text or not itp_result):
+                if pytesseract_module is None:
+                    try:
+                        import pytesseract as pytesseract_module
+                        if not self._configure_tesseract(pytesseract_module):
+                            pytesseract_module = None
+                    except Exception:
+                        pytesseract_module = None
+                if pytesseract_module is not None:
+                    ocr_text = self._ocr_full_page_text(page, pytesseract_module)
+
             if not comment_text:
                 if "нижеподписавш" in text.lower():
                     comment_text = self._extract_contractor_comment(text)
-                elif needs_ocr and comment_min_idx <= idx:
-                    if ocr_text is None:
-                        if pytesseract_module is None:
-                            try:
-                                import pytesseract as pytesseract_module
-                                if not self._configure_tesseract(pytesseract_module):
-                                    pytesseract_module = None
-                            except Exception:
-                                pytesseract_module = None
-                        if pytesseract_module is not None:
-                            ocr_text = self._ocr_full_page_text(page, pytesseract_module)
-                    if ocr_text and "нижеподписавш" in ocr_text.lower():
-                        comment_text = self._extract_contractor_comment(ocr_text)
+                elif ocr_text and "нижеподписавш" in ocr_text.lower():
+                    comment_text = self._extract_contractor_comment(ocr_text)
 
+            if not itp_result and comment_min_idx <= idx:
+                candidate_text = text if not needs_ocr else (ocr_text or "")
+                if candidate_text:
+                    # Интервал и данные о ПВА обычно на двух соседних
+                    # страницах — копим хвост текста, а не берём только
+                    # текущую страницу, иначе половина полей потеряется.
+                    itp_buffer = (itp_buffer + "\n" + candidate_text)[-6000:]
+                    itp_result = self._format_perforation_spec(itp_buffer)
+
+        if itp_result:
+            comment_text = f"{comment_text} {itp_result}".strip() if comment_text else itp_result
         return task_number, comment_text
 
     def _parse_performed_tasks(self, text: str) -> str:
