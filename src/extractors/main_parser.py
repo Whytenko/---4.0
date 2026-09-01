@@ -756,6 +756,7 @@ class FinalUnifiedParser:
     """Финальный объединенный парсер ВСЕХ данных"""
     _rate_reference_cache: dict | None = None
     _party_keywords_cache: tuple | None = None
+    _prayskurant_codes_cache: set | None = None
     
     def parse_all(self, pdf_path: str) -> WellData:
         """Парсит ВСЕ значения включая даты и возвращает объект WellData"""
@@ -1007,6 +1008,46 @@ class FinalUnifiedParser:
             for key, values in rates.items()
         }
         return self._rate_reference_cache
+
+    def _load_prayskurant_codes(self) -> set:
+        """Номера расценок из отдельного листа "Лист1" справочника по
+        километражу ("17. Отчет по километражу.xlsx") — это "Прейскурант
+        цен на отдельные виды геофизических исследований и работ в
+        скважинах не учтенных в ЕНВиР-99-Л-ЗС" (мобилизация/демобилизация,
+        переезды спецтехники, ГНКТ, X-MAC и т.д. — единичные услуги по
+        договорным ценам). Сам файл прямо оговаривает (строки 198, 200
+        листа): "коэффициенты, применяемые для ЕНВиР-99-Л-ЗС, не
+        распространяют своё действие на расценки из настоящего
+        прейскуранта" — то есть для этих расценок интегральный
+        коэффициент в акте должен быть строго 1.00, а не посчитанным по
+        температуре/углу, как для обычных строк ЕНВиР."""
+        if self._prayskurant_codes_cache is not None:
+            return self._prayskurant_codes_cache
+        codes: set = set()
+        try:
+            import openpyxl
+
+            excel_path = get_reference_dir() / "17. Отчет по километражу.xlsx"
+            if excel_path.exists():
+                wb = openpyxl.load_workbook(excel_path, data_only=True, read_only=True)
+                if "Лист1" in wb.sheetnames:
+                    ws = wb["Лист1"]
+                    for row in ws.iter_rows(values_only=True):
+                        value = row[2] if len(row) > 2 else None
+                        if value is None:
+                            continue
+                        text = str(value).strip()
+                        # Только настоящие номера расценок ("1807", "1833.1")
+                        # — заголовки разделов и примечания текстовые, этому
+                        # шаблону не соответствуют.
+                        if re.fullmatch(r"\d+(\.\d+)?", text):
+                            number = self._normalize_rate_number(text)
+                            if number:
+                                codes.add(number)
+        except Exception:
+            codes = set()
+        self._prayskurant_codes_cache = codes
+        return codes
 
     def _load_party_keywords(self) -> tuple:
         """Ключевые слова для классификации строк расценок (влияет ли угол
@@ -1402,6 +1443,7 @@ class FinalUnifiedParser:
         table = CoefficientTable()
         k_party = table.get_temperature_coefficient(temp)
         k_well = table.get_integral_coefficient(temp, angle_val) if angle_val is not None else None
+        prayskurant_codes = self._load_prayskurant_codes()
 
         details: List[str] = []
         ok_count = 0
@@ -1413,15 +1455,23 @@ class FinalUnifiedParser:
                 continue
 
             name = str(row.get("name", "")).strip()
-            work_type = self._classify_integral_work_type(name)
-            expected = k_well if work_type == "well" else k_party
+            rate_number = str(row.get("rate_number", ""))
+            # Расценки из Прейскуранта (мобилизация/переезды спецтехники,
+            # ГНКТ, X-MAC и т.п.) — договорные, коэффициент ЕНВиР к ним не
+            # применяется, ожидаем строго 1.00 независимо от температуры/угла.
+            if rate_number and rate_number in prayskurant_codes:
+                expected = 1.0
+                kind = "ед.усл."
+            else:
+                work_type = self._classify_integral_work_type(name)
+                expected = k_well if work_type == "well" else k_party
+                kind = "скв." if work_type == "well" else "парт."
             if expected is None:
                 continue
 
             match = math.isclose(float(actual), float(expected), rel_tol=0.0, abs_tol=0.02)
             name_short = name if len(name) <= 70 else f"{name[:67]}..."
             icon = "✅" if match else "❌"
-            kind = "скв." if work_type == "well" else "парт."
             details.append(
                 f"{icon} {name_short} | акт={float(actual):.2f} / расчёт={float(expected):.2f} ({kind})"
             )
