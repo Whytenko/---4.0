@@ -1,7 +1,20 @@
 Sub AppendToMasterRegistry()
     ' Кнопка живёт прямо в мастер-реестре (напр. "Проверка акт-нарядов
     ' 2026.xlsx") — ThisWorkbook и есть реестр, поэтому спрашиваем только
-    ' файл-источник (свежий отчёт), а пишем сразу в тот же лист, где кнопка.
+    ' файл-источник (свежий отчёт), а пишем сразу в эту же книгу.
+
+    ' Отчёт приложение реально сохраняет на диск (не только открывает) —
+    ' просто в малозаметную рабочую папку. Открываем диалог сразу там,
+    ' чтобы не искать файл руками по всему компьютеру.
+    Dim reportsFolder As String
+    reportsFolder = Environ("LOCALAPPDATA") & "\AktNaryadVerifier\output"
+    If Dir(reportsFolder, vbDirectory) <> "" Then
+        On Error Resume Next
+        ChDrive Left(reportsFolder, 1)
+        ChDir reportsFolder
+        On Error GoTo 0
+    End If
+
     Dim reportPath As Variant
     reportPath = Application.GetOpenFilename( _
         "Excel Files (*.xlsx;*.xlsm),*.xlsx;*.xlsm", , _
@@ -24,28 +37,57 @@ Sub AppendToMasterRegistry()
         Set srcWb = Workbooks.Open(CStr(reportPath))
     End If
 
-    Dim srcWs As Worksheet
+    ' --- Лист "Реестр" источника -> первый лист этой книги ---
+    Dim srcWsReg As Worksheet
     On Error Resume Next
-    Set srcWs = srcWb.Sheets("Реестр")
+    Set srcWsReg = srcWb.Sheets("Реестр")
     On Error GoTo 0
-    If srcWs Is Nothing Then
-        MsgBox "В выбранном файле отчёта нет листа ""Реестр"".", vbExclamation
-        If Not wasSrcOpen Then srcWb.Close SaveChanges:=False
-        Application.ScreenUpdating = True
-        Exit Sub
+
+    Dim addedReg As Long
+    addedReg = 0
+    If Not srcWsReg Is Nothing Then
+        addedReg = AppendRegistryRows(srcWsReg, ThisWorkbook.Sheets(1))
     End If
 
+    ' --- Лист "Сводка" источника -> лист "Сводка" этой книги (создаём при
+    ' первом переносе, дальше просто пополняем — с сохранением цветовой
+    ' подсветки по каждой проверке) ---
+    Dim srcWsSum As Worksheet
+    On Error Resume Next
+    Set srcWsSum = srcWb.Sheets("Сводка")
+    On Error GoTo 0
+
+    Dim addedSum As Long
+    addedSum = 0
+    If Not srcWsSum Is Nothing Then
+        Dim destWsSum As Worksheet
+        On Error Resume Next
+        Set destWsSum = ThisWorkbook.Sheets("Сводка")
+        On Error GoTo 0
+        If destWsSum Is Nothing Then
+            Set destWsSum = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+            destWsSum.Name = "Сводка"
+        End If
+        addedSum = AppendSummaryRows(srcWsSum, destWsSum)
+    End If
+
+    If Not wasSrcOpen Then srcWb.Close SaveChanges:=False
+    Application.ScreenUpdating = True
+
+    ThisWorkbook.Save
+
+    MsgBox "Готово." & vbCrLf & _
+        "Реестр: добавлено строк " & addedReg & "." & vbCrLf & _
+        "Сводка: добавлено строк " & addedSum & ".", vbInformation
+End Sub
+
+Private Function AppendRegistryRows(srcWs As Worksheet, destWs As Worksheet) As Long
     Dim lastRowSrc As Long
     lastRowSrc = srcWs.Cells(srcWs.Rows.Count, 1).End(xlUp).Row
     If lastRowSrc < 2 Then
-        MsgBox "В листе ""Реестр"" нет строк для переноса.", vbExclamation
-        If Not wasSrcOpen Then srcWb.Close SaveChanges:=False
-        Application.ScreenUpdating = True
-        Exit Sub
+        AppendRegistryRows = 0
+        Exit Function
     End If
-
-    Dim destWs As Worksheet
-    Set destWs = ThisWorkbook.Sheets(1)
 
     Dim lastRowDest As Long
     lastRowDest = destWs.Cells(destWs.Rows.Count, 1).End(xlUp).Row
@@ -87,12 +129,38 @@ Sub AppendToMasterRegistry()
         destRow = destRow + 1
     Next srcRow
 
-    If Not wasSrcOpen Then srcWb.Close SaveChanges:=False
-    Application.ScreenUpdating = True
+    AppendRegistryRows = lastRowSrc - 1
+End Function
 
-    ThisWorkbook.Save
+Private Function AppendSummaryRows(srcWs As Worksheet, destWs As Worksheet) As Long
+    Dim lastRowSrc As Long
+    lastRowSrc = srcWs.Cells(srcWs.Rows.Count, 1).End(xlUp).Row
+    If lastRowSrc < 2 Then
+        AppendSummaryRows = 0
+        Exit Function
+    End If
 
-    Dim addedCount As Long
-    addedCount = lastRowSrc - 1
-    MsgBox "Готово: добавлено строк " & addedCount & ".", vbInformation
-End Sub
+    Dim colCount As Long
+    colCount = srcWs.Cells(1, srcWs.Columns.Count).End(xlToLeft).Column
+
+    Dim lastRowDest As Long
+    lastRowDest = destWs.Cells(destWs.Rows.Count, 1).End(xlUp).Row
+
+    ' Лист только что создан (пуст) — сначала копируем шапку с колонками.
+    If destWs.Cells(1, 1).Value = "" Then
+        srcWs.Range(srcWs.Cells(1, 1), srcWs.Cells(1, colCount)).Copy
+        destWs.Cells(1, 1).PasteSpecial xlPasteAll
+        Application.CutCopyMode = False
+        lastRowDest = 1
+    End If
+
+    ' Копируем значения И форматирование (в т.ч. цветовую заливку по
+    ' статусу проверки) одним диапазоном — не строка за строкой.
+    Dim srcRange As Range
+    Set srcRange = srcWs.Range(srcWs.Cells(2, 1), srcWs.Cells(lastRowSrc, colCount))
+    srcRange.Copy
+    destWs.Cells(lastRowDest + 1, 1).PasteSpecial xlPasteAll
+    Application.CutCopyMode = False
+
+    AppendSummaryRows = lastRowSrc - 1
+End Function
