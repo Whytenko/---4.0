@@ -1607,15 +1607,31 @@ class FinalUnifiedParser:
         распознанной задачей из шапки акта (task_number/performed_tasks,
         чистый текст, без OCR) — если они не совпадают, значение отбрасываем
         (в отчёте вместо него встанет запасной вариант performed_tasks),
-        а не показываем вероятно garbled цифры."""
+        а не показываем вероятно garbled цифры.
+
+        Недоход — исключение из этого правила, а не признак плохого OCR:
+        по инструкции, если по заявке (напр. №58) прибор не дошёл до
+        глубины, в шапке акта проставляется задача 500.4, а заявка при
+        этом честно запрашивала СОВСЕМ ДРУГУЮ задачу (см. doc_linking.
+        check_against_zayavka — там это же расхождение считается
+        ожидаемым, не ошибкой). Раньше эта функция как раз ЗДЕСЬ
+        отбрасывала верный номер заявки (потому что он не совпадал с
+        "500.4"), и в реестр в колонку "Заявка" попадала сама задача
+        недохода (500.4) вместо реально запрошенной — то есть ровно
+        наоборот от того, что должно быть."""
         if not ocr_task:
             return False
         ocr_lead = re.match(r'\d+', ocr_task)
         if not ocr_lead:
             return False
         ocr_lead = ocr_lead.group()
-        for task in performed_tasks.split("+"):
-            performed_lead = re.match(r'\d+', task.strip())
+
+        tasks = [t.strip() for t in performed_tasks.split("+") if t.strip()]
+        if any(task.startswith("500.4") for task in tasks):
+            return True
+
+        for task in tasks:
+            performed_lead = re.match(r'\d+', task)
             if performed_lead and performed_lead.group() == ocr_lead:
                 return True
         return not performed_tasks
