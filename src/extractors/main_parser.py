@@ -783,6 +783,7 @@ class FinalUnifiedParser:
     _rate_reference_cache: dict | None = None
     _party_keywords_cache: tuple | None = None
     _prayskurant_codes_cache: set | None = None
+    _prayskurant_prices_cache: dict | None = None
     
     def parse_all(self, pdf_path: str) -> WellData:
         """Парсит ВСЕ значения включая даты и возвращает объект WellData"""
@@ -972,59 +973,69 @@ class FinalUnifiedParser:
     def _load_rate_reference(self) -> dict:
         if self._rate_reference_cache is not None:
             return self._rate_reference_cache
-        csv_path = self._resolve_rate_csv_path()
-        if not csv_path or not csv_path.exists():
-            self._rate_reference_cache = {}
-            return self._rate_reference_cache
-        try:
-            df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
-        except Exception:
-            self._rate_reference_cache = {}
-            return self._rate_reference_cache
-        if df.empty:
-            self._rate_reference_cache = {}
-            return self._rate_reference_cache
-
-        columns = list(df.columns)
-        number_col = None
-        price_col = None
-        norm_col = None
-
-        for col in columns:
-            col_norm = self._normalize_for_match(str(col)).replace("_", " ")
-            if number_col is None and "номер" in col_norm and "расцен" in col_norm:
-                number_col = col
-            if price_col is None and (
-                ("стоим" in col_norm and ("руб" in col_norm or "расцен" in col_norm or "цена" in col_norm))
-                or col_norm == "стоимость руб"
-            ):
-                price_col = col
-            if norm_col is None and "норма" in col_norm and "врем" in col_norm:
-                norm_col = col
-
-        if number_col is None:
-            number_col = columns[0]
-        if price_col is None and len(columns) > 1:
-            price_col = columns[1]
 
         rates: dict[str, dict[str, set[float]]] = {}
-        for _, row in df.iterrows():
-            number = self._normalize_rate_number(row.get(number_col))
-            if not number:
-                continue
+        csv_path = self._resolve_rate_csv_path()
+        df = None
+        if csv_path and csv_path.exists():
+            try:
+                df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+            except Exception:
+                df = None
 
-            if number not in rates:
-                rates[number] = {"prices": set(), "norms": set()}
+        if df is not None and not df.empty:
+            columns = list(df.columns)
+            number_col = None
+            price_col = None
+            norm_col = None
 
-            if price_col is not None:
-                price = self._parse_decimal(row.get(price_col))
-                if price is not None:
-                    rates[number]["prices"].add(round(price, 2))
+            for col in columns:
+                col_norm = self._normalize_for_match(str(col)).replace("_", " ")
+                if number_col is None and "номер" in col_norm and "расцен" in col_norm:
+                    number_col = col
+                if price_col is None and (
+                    ("стоим" in col_norm and ("руб" in col_norm or "расцен" in col_norm or "цена" in col_norm))
+                    or col_norm == "стоимость руб"
+                ):
+                    price_col = col
+                if norm_col is None and "норма" in col_norm and "врем" in col_norm:
+                    norm_col = col
 
-            if norm_col is not None:
-                norm_value = self._parse_decimal(row.get(norm_col))
-                if norm_value is not None:
-                    rates[number]["norms"].add(round(norm_value, 2))
+            if number_col is None:
+                number_col = columns[0]
+            if price_col is None and len(columns) > 1:
+                price_col = columns[1]
+
+            for _, row in df.iterrows():
+                number = self._normalize_rate_number(row.get(number_col))
+                if not number:
+                    continue
+
+                if number not in rates:
+                    rates[number] = {"prices": set(), "norms": set()}
+
+                if price_col is not None:
+                    price = self._parse_decimal(row.get(price_col))
+                    if price is not None:
+                        rates[number]["prices"].add(round(price, 2))
+
+                if norm_col is not None:
+                    norm_value = self._parse_decimal(row.get(norm_col))
+                    if norm_value is not None:
+                        rates[number]["norms"].add(round(norm_value, 2))
+
+        # Дополняем ценами из Прейскуранта (лист "Лист1" справочника по
+        # километражу) — не все расценки единичных услуг попали в
+        # основной tabale_rascenki.csv, из-за чего проверка расценок
+        # ложно показывала "не найдено в прил." для кода, который на
+        # самом деле есть и совпадает по цене (реальный пример: расценка
+        # №1372, задача 87(Н), акт 13447 — цена в акте 525523,50 точно
+        # совпадает с Прейскурантом, а в CSV этого кода просто не было).
+        # Норму времени не добавляем — у этих расценок её нет и не
+        # предусмотрено (см. _check_rate_prices_from_rows).
+        for number, price_set in self._load_prayskurant_prices().items():
+            entry = rates.setdefault(number, {"prices": set(), "norms": set()})
+            entry["prices"].update(price_set)
 
         self._rate_reference_cache = {
             key: {
@@ -1034,6 +1045,41 @@ class FinalUnifiedParser:
             for key, values in rates.items()
         }
         return self._rate_reference_cache
+
+    def _load_prayskurant_prices(self) -> dict:
+        """Цены расценок из "Лист1" справочника по километражу (тот же
+        файл и тот же лист, что и _load_prayskurant_codes) — читаются
+        отдельно и напрямую сюда не кэшируют коды, чтобы не завязывать
+        два разных потребителя (проверка коэффициента и проверка
+        расценок) на один и тот же кэш."""
+        if self._prayskurant_prices_cache is not None:
+            return self._prayskurant_prices_cache
+        prices: dict[str, set] = {}
+        try:
+            import openpyxl
+
+            excel_path = get_reference_dir() / "17. Отчет по километражу.xlsx"
+            if excel_path.exists():
+                wb = openpyxl.load_workbook(excel_path, data_only=True, read_only=True)
+                if "Лист1" in wb.sheetnames:
+                    ws = wb["Лист1"]
+                    for row in ws.iter_rows(values_only=True):
+                        if len(row) < 8:
+                            continue
+                        text = str(row[2]).strip() if row[2] is not None else ""
+                        if not re.fullmatch(r"\d+(\.\d+)?", text):
+                            continue
+                        number = self._normalize_rate_number(text)
+                        if not number:
+                            continue
+                        for col in (5, 6, 7):
+                            value = self._parse_decimal(row[col])
+                            if value is not None:
+                                prices.setdefault(number, set()).add(round(value, 2))
+        except Exception:
+            prices = {}
+        self._prayskurant_prices_cache = prices
+        return prices
 
     def _load_prayskurant_codes(self) -> set:
         """Номера расценок из отдельного листа "Лист1" справочника по
