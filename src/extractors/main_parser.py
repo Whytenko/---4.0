@@ -1746,9 +1746,13 @@ class FinalUnifiedParser:
     _ITP_DENSITY_RE: ClassVar = re.compile(
         r'Плотность\s+снаряжения\s+ПВА[.,]?\s*_*([\d][\d+\s]*?)\.?\s*отв', re.IGNORECASE
     )
-    _ITP_VOLUME_RE: ClassVar = re.compile(r'Объем\s+работ\s+(\d+)\s*заряд', re.IGNORECASE)
+    # "заря[дл]" — OCR иногда путает "д" и "л" ("зарядов" -> "зарялов",
+    # реальный акт 13593: "22. Объем работ 96 зарялов."), без этого
+    # допуска строка вообще не находилась и весь результат отбрасывался
+    # (требуем заряд+плотность+объём вместе, см. _format_perforation_spec).
+    _ITP_VOLUME_RE: ClassVar = re.compile(r'Объем\s+работ\s+(\d+)\s*заря[дл]', re.IGNORECASE)
     _ITP_VOLUME_REVERSED_RE: ClassVar = re.compile(
-        r'Объем\s+работ\s+заряд[а-я]*\.?\s*(\d+)', re.IGNORECASE
+        r'Объем\s+работ\s+заря[дл][а-я]*\.?\s*(\d+)', re.IGNORECASE
     )
 
     def _format_perforation_spec(self, buffer: str) -> str:
