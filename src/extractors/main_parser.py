@@ -434,15 +434,19 @@ class WellData:
         считалась только в пакетном Excel-отчёте (table_parser.
         get_temperature_status), отдельно от остальных проверок; здесь —
         тот же расчёт, чтобы попасть в общий список и при проверке
-        одного акта (кнопка "Пуск"), а не только пакетом."""
+        одного акта (кнопка "Пуск"), а не только пакетом.
+
+        Подробности выводим и при "ок" — иначе голое "✅" без единой
+        цифры не даёт понять, с каким значением справочника сверялось
+        (та же правка, что раньше для километража/барометрии)."""
         from src.extractors import table_parser
 
         result = table_parser.get_temperature_status(self)
         status = result.get("status", "neutral")
-        if status != "bad":
+        if status not in ("ok", "bad"):
             return {"status": status}
         return {
-            "status": "bad",
+            "status": status,
             "details": [
                 f"    в акте {result['pdf_temp']:.1f}°C, по отчёту {result['avg_temp']:.1f}°C "
                 f"(разница {result['diff']:.1f}°C, допуск 5°C)"
@@ -710,15 +714,37 @@ class WellData:
             label = label_map.get(attr, attr)
             old_val = old if old else "—"
             print(f"    {label}: {old_val} → {new}")
+    def _read_vm_price_sheet(self, excel_path):
+        """Лист с ценами ВМ называется "Прейск_<год>" — при обновлении
+        справочника пользователем (кнопка "Обновить справочник") год может
+        смениться ("Прейск_2019" → "Прейск_2026" и т.п.), а жёстко зашитое
+        имя листа тогда просто не находится. Пробуем ожидаемое имя как
+        есть; иначе ищем любой лист с префиксом "прейск" (берём последний
+        по алфавиту — как правило, самый свежий год); и только в крайнем
+        случае — первый лист файла, чтобы вообще не свалиться."""
+        sheet_names = pd.ExcelFile(excel_path).sheet_names
+        target = "Прейск_2019"
+        if target not in sheet_names:
+            candidates = sorted(name for name in sheet_names if name.strip().lower().startswith("прейск"))
+            target = candidates[-1] if candidates else sheet_names[0]
+        return pd.read_excel(excel_path, sheet_name=target, header=None)
+
     def _get_vm_prices(self, task: str, unit_price: float | None = None):
         excel_path = get_reference_dir() / "Стоимость ВМ задачи (не удалять).xlsx"
         if not excel_path.exists():
             return None, None
         if WellData._vm_price_df_cache is None:
-            WellData._vm_price_df_cache = pd.read_excel(
-                excel_path, sheet_name="Прейск_2019", header=None
-            )
+            try:
+                WellData._vm_price_df_cache = self._read_vm_price_sheet(excel_path)
+            except Exception:
+                # Обновлённый пользователем файл может прийти с другим
+                # годом в имени листа ("Прейск_2019" -> "Прейск_2026" и
+                # т.д.) или вовсе битым — не роняем всю проверку акта
+                # из-за одного справочника, просто "нет данных".
+                return None, None
         df = WellData._vm_price_df_cache
+        if df is None:
+            return None, None
         best_row = None
         best_diff = None
         for i in range(2, df.shape[0]):
