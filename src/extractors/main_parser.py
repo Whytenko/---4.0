@@ -839,6 +839,7 @@ class FinalUnifiedParser:
     _party_keywords_cache: tuple | None = None
     _prayskurant_codes_cache: set | None = None
     _prayskurant_prices_cache: dict | None = None
+    _prayskurant_41_cache: dict | None = None
     
     def parse_all(self, pdf_path: str) -> WellData:
         """Парсит ВСЕ значения включая даты и возвращает объект WellData"""
@@ -1095,6 +1096,15 @@ class FinalUnifiedParser:
             entry = rates.setdefault(number, {"prices": set(), "norms": set()})
             entry["prices"].update(price_set)
 
+        # Плюс Приложение №41 к договору №23С1816 (ТПП «Повхнефтегаз») —
+        # отдельный, более полный и более новый список той же категории
+        # "единичных услуг" (127 кодов, годы 2023-2026), см.
+        # _load_prayskurant_41. Объединение только расширяет набор
+        # допустимых цен, ранее корректные акты остаются корректными.
+        for number, price_set in self._load_prayskurant_41()["prices"].items():
+            entry = rates.setdefault(number, {"prices": set(), "norms": set()})
+            entry["prices"].update(price_set)
+
         self._rate_reference_cache = {
             key: {
                 "prices": sorted(values.get("prices", set())),
@@ -1176,8 +1186,49 @@ class FinalUnifiedParser:
                                 codes.add(number)
         except Exception:
             codes = set()
+        codes |= self._load_prayskurant_41()["codes"]
         self._prayskurant_codes_cache = codes
         return codes
+
+    def _load_prayskurant_41(self) -> dict:
+        """Расценки из Приложения №41 к договору №23С1816 (ТПП
+        «Повхнефтегаз») — "Прейскурант цен на отдельные виды
+        геофизических исследований и работ в скважинах, не учтенных в
+        ЕНВиР-99-Л-ЗС" (reference/prayskurant_41_povkh.csv — экспорт из
+        оригинального xlsx, предоставленного пользователем). Та же
+        категория "единичных услуг", что и "Лист1" в "17. Отчет по
+        километражу.xlsx" (_load_prayskurant_codes/_prices) — файл
+        содержит ту же оговорку ("коэффициенты ЕНВиР... не
+        распространяют своё действие на расценки из настоящего
+        прейскуранта"), а для расценок №№1120,1121,1836 отдельно
+        оговорено "к оплате предъявляется фактическое время работы
+        партии" — основание для _check_billed_hours_vs_duration.
+        Отдельный файл, а не объединение с Лист1 в один: это более
+        полный (127 кодов против 112) и более новый (годы 2023-2026
+        против 2026-2028) источник, сверяются оба — объединение (union)
+        только расширяет набор допустимых цен, не сужая его, поэтому
+        ранее корректные акты не могут стать некорректными."""
+        if self._prayskurant_41_cache is not None:
+            return self._prayskurant_41_cache
+        codes: set = set()
+        prices: dict[str, set] = {}
+        try:
+            csv_path = get_reference_dir() / "prayskurant_41_povkh.csv"
+            if csv_path.exists():
+                df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig", sep=";")
+                for _, row in df.iterrows():
+                    number = self._normalize_rate_number(row.get("rate_number"))
+                    if not number:
+                        continue
+                    codes.add(number)
+                    for col in ("price_2023", "price_2024", "price_2025", "price_2026"):
+                        value = self._parse_decimal(row.get(col))
+                        if value is not None:
+                            prices.setdefault(number, set()).add(round(value, 2))
+        except Exception:
+            codes, prices = set(), {}
+        self._prayskurant_41_cache = {"codes": codes, "prices": prices}
+        return self._prayskurant_41_cache
 
     def _load_party_keywords(self) -> tuple:
         """Ключевые слова для классификации строк расценок (влияет ли угол

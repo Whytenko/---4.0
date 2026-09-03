@@ -44,6 +44,7 @@ REQUIRED_REFERENCE_FILES = (
 OPTIONAL_REFERENCE_FILES = (
     "coeff_dogovor.csv",
     "integral_party_keywords.csv",
+    "prayskurant_41_povkh.csv",
 )
 
 
