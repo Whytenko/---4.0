@@ -88,6 +88,44 @@ def test_tech_duty_exceeds_norm():
     assert well._check_tech_duty_hours(rows)["status"] == "bad"
 
 
+# ---- Часы "Работа партии" vs продолжительность сессии ----
+# Реальный акт 06513 (задача 61/61.1, ЛГПО): одна и та же сессия (151ч по
+# датам начала/окончания) была выставлена один раз на 151ч (верно), другой
+# раз на 127ч (заниженный биллинг, не пойман ни одной другой проверкой).
+
+def test_hours_vs_duration_match():
+    well = _make_well_data(start_date="05.05.2026 11:00", end_date="11.05.2026 18:00")  # 151ч
+    rows = [{"name": "Работа партии по ликвидации гидрато-парафиновой пробки (ЛГПО)",
+             "unit": "час", "volume": 151.0}]
+    assert well._check_billed_hours_vs_duration(rows)["status"] == "ok"
+
+
+def test_hours_vs_duration_mismatch():
+    well = _make_well_data(start_date="05.05.2026 11:00", end_date="11.05.2026 18:00")  # 151ч
+    rows = [{"name": "Работа партии по ликвидации гидрато-парафиновой пробки (ЛГПО)",
+             "unit": "час", "volume": 127.0}]
+    assert well._check_billed_hours_vs_duration(rows)["status"] == "bad"
+
+
+def test_hours_vs_duration_neutral_without_party_rows():
+    well = _make_well_data()
+    rows = [{"name": "Запись муфтовых соед.локатором муфт (ЛМ)", "unit": "точ.", "volume": 5.0}]
+    assert well._check_billed_hours_vs_duration(rows)["status"] == "neutral"
+
+
+def test_hours_vs_duration_ignores_tech_duty_and_short_hour_measurements():
+    """Реальный акт 13237 (задача 34(S)): почасовая строка "Регистрация КВД
+    в таймерном режиме" — 3ч из 21ч полной сессии, это НЕ ошибка (одна из
+    множества операций многопунктового акта, не биллинг всей сессии).
+    "Тех.дежурство" — отдельная проверка с другим порогом/смыслом."""
+    well = _make_well_data(start_date="25.08.2026 05:00", end_date="26.08.2026 02:00")  # 21ч
+    rows = [
+        {"name": "Регистрация КВД в таймерном режиме,заб.", "unit": "час", "volume": 3.0},
+        {"name": "Тех.дежурство компл. партии в действ.фонде", "unit": "1 пар/час", "volume": 2.0},
+    ]
+    assert well._check_billed_hours_vs_duration(rows)["status"] == "neutral"
+
+
 # ---- Пересечение термометрии 200/500 ----
 
 def test_thermometry_overlap_detected():

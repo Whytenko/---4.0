@@ -101,6 +101,7 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
             checks["contract_coeff"]["status"],
             checks["barometry_task53"]["status"],
             checks["tech_duty"]["status"],
+            checks["hours_vs_duration"]["status"],
             checks["thermometry_overlap"]["status"],
             checks["interval_length"]["status"],
             checks["spo_zakaz"]["status"],
@@ -129,12 +130,19 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
                 "Коэфф. по договору": _label(checks["contract_coeff"]["status"]),
                 "Барометрия@53": _label(checks["barometry_task53"]["status"]),
                 "Тех.дежурство >4ч": _label(checks["tech_duty"]["status"]),
+                "Часы партии vs продолж.": _label(checks["hours_vs_duration"]["status"]),
                 "Термометрия 200/500": _label(checks["thermometry_overlap"]["status"]),
                 "Интервал ≤100м (стр.1)": _label(checks["interval_length"]["status"]),
                 "СПО (акт-наряд vs акт-заказ)": _label(checks["spo_zakaz"]["status"]),
                 "Сверка с заявкой": _label(checks["zayavka"]["status"]),
                 "Температура": _label(temp_status["status"]),
                 "Километраж": _label_km(km_status),
+                # Интервал/тип заряда/плотность/объём со страницы ИТП/ПВР —
+                # отдельной колонкой (не только частью "Комментарии" в
+                # листе "Реестр"), чтобы было видно сразу, не открывая
+                # общий текст комментария. Пусто, если акт не про
+                # перфорацию или страница не найдена.
+                "Спецификация перфорации": well_data.perforation_spec,
                 "ИТОГ": _row_overall(statuses),
             }
         )

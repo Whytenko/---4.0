@@ -153,6 +153,11 @@ class WellData:
     # прибора, осмотр перфоратора и т.д. Появляется не в каждом акте.
     # Для колонки "Комментарии" в реестре "Проверка акт-нарядов".
     contractor_comment: str = ""
+    # То же самое (интервал перфорации, тип заряда, плотность снаряжения
+    # ПВА, объём работ) со страницы ИТП/ПВР — отдельным полем, а не
+    # только частью contractor_comment, чтобы это было видно в отчёте
+    # отдельной колонкой, а не растворялось внутри общего комментария.
+    perforation_spec: str = ""
     # Путь к исходному PDF — нужен проверке километража (km_parser заново
     # открывает файл для доступа к сканам/таблице переездов на стр.1).
     # Раньше км/температура считались только в пакетном режиме отдельно
@@ -214,6 +219,9 @@ class WellData:
          "Барометрия при задаче №53", True),
         ("tech_duty", lambda self: self._prefix_details(self.check_results.get("tech_duty", {"status": "neutral"})),
          "Тех.дежурство >4ч (нужен акт)", True),
+        ("hours_vs_duration",
+         lambda self: self._prefix_details(self.check_results.get("hours_vs_duration", {"status": "neutral"})),
+         "Часы работы партии vs продолж.", True),
         ("thermometry_overlap",
          lambda self: self._prefix_details(self.check_results.get("thermometry_overlap", {"status": "neutral"})),
          "Термометрия 200/500 (пересечение)", True),
@@ -261,6 +269,8 @@ class WellData:
         print(f"  Продолжительность работ: {self.duration_hours:.2f} часов")
         if self.task_number:
             print(f"  Номер задачи: {self.task_number}")
+        if self.perforation_spec:
+            print(f"  Спецификация перфорации: {self.perforation_spec}")
         for _key, getter, label, silent in self._CHECK_REGISTRY_BEFORE_ML:
             self._print_check(getter, label, silent)
         self._print_ml_info()
@@ -604,6 +614,51 @@ class WellData:
             return {"status": "bad", "details": flagged}
         return {"status": "ok", "details": [f"В норме (≤{threshold_hours:.0f} ч), строк проверено: {checked}"]}
 
+    def _check_billed_hours_vs_duration(self, rows: List[dict]) -> dict:
+        """"Работа партии" с почасовой оплатой должна суммарно покрывать
+        всю продолжительность сессии (стр.1 "начало"/"окончание") — сам
+        подрядчик занят этой одной задачей весь период, в отличие от
+        "Тех.дежурство" (отдельная проверка, другой порог 4ч) или разовых
+        почасовых измерений вроде "Регистрация КВД в таймерном режиме"
+        (может быть лишь частью более крупного многопунктового акта —
+        напр. реальный акт 13237, задача 34(S): 3ч КВД при полной сессии
+        21ч, это НЕ ошибка). Поэтому ищем именно "работа" + "парти" рядом
+        (без пробелов после нормализации) — это исключает и "тех.
+        дежурство компл. партии", и "работа компл.партии в действ.фонде"
+        (обе содержат "компл." между словами), оставляя только буквальное
+        "Работа партии" — найдено на реальном акте 06513 (задача 61/61.1,
+        ЛГПО): один и тот же акт был выставлен один раз на 127ч, другой
+        раз на 151ч, при этом реальная продолжительность сессии — 151ч
+        (05.05 11:00 - 11.05 18:00). Версия на 127ч — заниженный биллинг,
+        не пойманный ни одной другой существующей проверкой."""
+        if self.duration_hours <= 0:
+            return {"status": "neutral"}
+        total_billed = 0.0
+        matched_names: List[str] = []
+        for row in rows:
+            name = str(row.get("name", "")).strip()
+            norm = re.sub(r"\s+", "", name.lower())
+            if "работапарти" not in norm:
+                continue
+            unit = str(row.get("unit", "")).strip().lower()
+            if unit not in ("час", "часа", "часов"):
+                continue
+            volume = row.get("volume")
+            if not isinstance(volume, (int, float)):
+                continue
+            total_billed += volume
+            matched_names.append(name)
+        if not matched_names:
+            return {"status": "neutral"}
+        tolerance = 1.0
+        delta = self.duration_hours - total_billed
+        name_short = matched_names[0] if len(matched_names[0]) <= 60 else f"{matched_names[0][:57]}..."
+        details = [
+            name_short,
+            f"Продолжительность работ: {self.duration_hours:.2f} ч / оплачено часов: {total_billed:.2f} ч",
+        ]
+        return {"status": "ok" if abs(delta) <= tolerance else "bad", "details": details}
+
     def _tech_duty_hours_from_rows(self, rows: List[dict]) -> float | None:
         """Часы тех.дежурства из уже надёжно распознанных строк расценок
         (не OCR) — реальные акты сокращают название по-разному ("Тех.деж-
@@ -845,7 +900,9 @@ class FinalUnifiedParser:
                 well_data.act_number, well_data.act_date = self._parse_act_number_and_date(text)
                 well_data.total_cost = self._parse_total_cost(text)
                 well_data.performed_tasks = self._parse_performed_tasks(text)
-                ocr_task, well_data.contractor_comment = self._parse_zayavka_and_comment(pdf)
+                ocr_task, well_data.contractor_comment, well_data.perforation_spec = (
+                    self._parse_zayavka_and_comment(pdf)
+                )
                 if self._task_number_plausible(ocr_task, well_data.performed_tasks):
                     well_data.embedded_zayavka_task = ocr_task
                 if scan_idx is not None and scan_idx < len(pdf.pages):
@@ -868,6 +925,7 @@ class FinalUnifiedParser:
 
                 well_data.check_results["barometry_task53"] = well_data._check_barometry_task53(rate_rows)
                 well_data.check_results["tech_duty"] = well_data._check_tech_duty_hours(rate_rows)
+                well_data.check_results["hours_vs_duration"] = well_data._check_billed_hours_vs_duration(rate_rows)
                 well_data.check_results["thermometry_overlap"] = well_data._check_thermometry_overlap(rate_rows)
                 well_data.check_results["interval_length"] = well_data._check_interval_length(rate_rows)
                 well_data.check_results["spo_zakaz"] = well_data._check_spo_zakaz(rate_rows)
@@ -1162,6 +1220,7 @@ class FinalUnifiedParser:
         spent_col = None
         interval_from_col = None
         interval_to_col = None
+        unit_col = None
 
         for idx, row in enumerate(table[:8]):
             if not row:
@@ -1182,6 +1241,8 @@ class FinalUnifiedParser:
                     coeff_col = col_idx
                 if "затрат" in norm and "времен" in norm:
                     spent_col = col_idx
+                if "единица" in norm and "измерен" in norm:
+                    unit_col = col_idx
             if number_col is not None and price_col is not None:
                 header_idx = idx
                 # "интервал" ищем только в строке, уже подтверждённой как
@@ -1217,6 +1278,7 @@ class FinalUnifiedParser:
                 spent_col = 9
                 interval_from_col = 3
                 interval_to_col = 4
+                unit_col = 2
             else:
                 return []
 
@@ -1276,6 +1338,10 @@ class FinalUnifiedParser:
             if interval_to_col is not None and interval_to_col < len(row):
                 interval_to_value = self._parse_decimal(row[interval_to_col])
 
+            unit_value = ""
+            if unit_col is not None and unit_col < len(row) and row[unit_col]:
+                unit_value = " ".join(str(row[unit_col]).split()).lower()
+
             name = ""
             if name_col < len(row) and row[name_col]:
                 name = " ".join(str(row[name_col]).split())
@@ -1287,6 +1353,7 @@ class FinalUnifiedParser:
                 {
                     "name": name,
                     "rate_number": rate_number,
+                    "unit": unit_value,
                     "rate_price": round(rate_price, 2),
                     "volume": round(volume_value, 2) if volume_value is not None else None,
                     "norm_time": round(norm_value, 2) if norm_value is not None else None,
@@ -1804,7 +1871,7 @@ class FinalUnifiedParser:
         except Exception:
             return ""
 
-    def _parse_zayavka_and_comment(self, pdf) -> tuple[str, str]:
+    def _parse_zayavka_and_comment(self, pdf) -> tuple[str, str, str]:
         """Один проход по страницам акта — номер задачи из встроенной
         ЗАЯВКИ (лист "ЗАЯВКА на проведение промыслово-геофизических
         исследований скважин", обычно 4-й), текст комментария подрядчика
@@ -1813,7 +1880,14 @@ class FinalUnifiedParser:
         НА ПРОИЗВОДСТВО ПВР" (задачи с перфорацией, напр. №58) — все три
         поля с OCR-фоллбэком: на реальных актах эти страницы чаще скан,
         чем цифровой текст. Общий проход экономит OCR — не открываем те
-        же страницы дважды под каждое поле по отдельности."""
+        же страницы дважды под каждое поле по отдельности.
+
+        Спецификация перфорации возвращается ОТДЕЛЬНЫМ третьим значением
+        (для своей колонки в отчёте), но также остаётся приклеенной к
+        comment_text — колонка "Комментарии" в реестре заказчика для
+        перфорации как раз и состоит из этого текста (см. реальные
+        примеры в справочном Excel), это не дублирование, а два разных
+        адресата одного и того же факта."""
         task_number = ""
         comment_text = ""
         itp_result = ""
@@ -1888,7 +1962,7 @@ class FinalUnifiedParser:
 
         if itp_result:
             comment_text = f"{comment_text} {itp_result}".strip() if comment_text else itp_result
-        return task_number, comment_text
+        return task_number, comment_text, itp_result
 
     def _parse_performed_tasks(self, text: str) -> str:
         """Все задачи, перечисленные в шапке акта ('Задача №54.1', 'Задача
