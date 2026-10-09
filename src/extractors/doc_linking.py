@@ -6,6 +6,8 @@ from typing import List, Optional
 
 import pdfplumber
 
+from src.utils import pdf_safe  # noqa: F401
+
 # Порядок значим: заявка/акт-на-простой распознаются по достаточно
 # специфичным маркерам; всё остальное по умолчанию считается акт-нарядом
 # (как и раньше, до появления пакетной проверки) — чтобы неопознанный формат
@@ -114,6 +116,27 @@ def _parse_well_number(text: str) -> str:
     return match.group(1) if match else ""
 
 
+def _same_task(act_task: str, zayavka_task: str) -> bool:
+    """Номер задачи в акте теперь хранится с буквенным суффиксом
+    ("35(S)"), а из заявки он читается без него ("35") — такое
+    расхождение не ошибка. Разные номера ("58" и "58.141") и разные
+    суффиксы у обеих сторон по-прежнему считаются несовпадением."""
+    def _split(value: str) -> tuple:
+        match = re.match(r'\s*([0-9]+(?:\.[0-9]+)?)\s*(?:\(([^)]*)\))?', value)
+        if not match:
+            return value.strip(), ""
+        suffix = (match.group(2) or "").strip().upper()
+        # Одинаково выглядящие буквы в двух алфавитах: "80(P)" и "80(Р)".
+        suffix = suffix.translate(str.maketrans("РНСАВЕКМОТХ", "PHCABEKMOTX"))
+        return match.group(1), suffix
+
+    act_base, act_suffix = _split(act_task)
+    zay_base, zay_suffix = _split(zayavka_task)
+    if act_base != zay_base:
+        return False
+    return not act_suffix or not zay_suffix or act_suffix == zay_suffix
+
+
 def _parse_task_number(text: str) -> str:
     match = re.search(r'Задача\s*№?\s*([0-9]+(?:\.[0-9]+)?)', text)
     return match.group(1) if match else ""
@@ -185,7 +208,7 @@ def check_against_zayavka(well_data, zayavka: Optional[dict]) -> dict:
         # в акте должна стоять задача 500.4. Это ожидаемое несовпадение,
         # а не ошибка.
         note = f"Недоход: заявка на задачу №{zay_task or '?'}, в акте — 500.4 (ожидаемо)"
-    elif zay_task and act_task and zay_task != act_task:
+    elif zay_task and act_task and not _same_task(act_task, zay_task):
         mismatches.append(f"Номер задачи: акт={act_task} / заявка={zay_task}")
 
     status = "bad" if mismatches else "ok"

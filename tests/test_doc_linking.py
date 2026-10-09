@@ -90,3 +90,12 @@ def test_nedokhod_500_4_is_expected_not_flagged():
     result = doc_linking.check_against_zayavka(well, zayavka)
     assert result["status"] == "ok"
     assert any("Недоход" in line for line in result["details"])
+
+
+def test_task_suffix_missing_in_zayavka_is_not_mismatch():
+    # В акте "35(S)", из заявки номер читается без суффикса — не ошибка.
+    from src.extractors.doc_linking import _same_task
+    assert _same_task("35(S)", "35")
+    assert _same_task("80(P)", "80(Р)")  # латинская и кириллическая "Р"
+    assert not _same_task("80(P)", "80(S)")
+    assert not _same_task("58.141", "58")

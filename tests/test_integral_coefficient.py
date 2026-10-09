@@ -111,3 +111,29 @@ def test_interval_columns_extracted_from_dynamic_header():
     assert len(rows) == 1
     assert rows[0]["interval_from"] == 2390.0
     assert rows[0]["interval_to"] == 2500.0
+
+
+def test_perforation_surface_works_ignore_angle():
+    """Реальные акты 12271, 13096, 13102 (темп=0, угол 30-70°): получение/
+    снаряжение зарядов и работа перфораторной партии — работы на
+    поверхности, идут с 1.00, а не со "скважинным" 1.15."""
+    rows = [
+        {"name": "Получение зарядов АДС, ПГД/БК, ПГРИ", "integral_coeff": 1.00},
+        {"name": "Получение перфораторных зарядов", "integral_coeff": 1.00},
+        {"name": "Снаряжение перфоратора ПНКТ", "integral_coeff": 1.00},
+        {"name": "Работа перфораторной партии", "integral_coeff": 1.00},
+        {"name": "Торпедирование, работа труборезом ТРК", "integral_coeff": 1.15},
+    ]
+    status, details = _parser._check_integral_rows(rows, "0", "69,57")
+    assert status == "ok", details
+
+
+def test_prayskurant_rate_expects_no_integral_coefficient():
+    """Расценки Прейскуранта ("Лист1" в "17. Отчет по километражу.xlsx")
+    договорные — коэффициенты ЕНВиР на них не действуют: ожидается 1.00
+    при любой температуре/угле, а применённый коэффициент — расхождение."""
+    row = {"name": "Переезд ЛПС", "rate_number": "1819"}
+    status, details = _parser._check_integral_rows([dict(row, integral_coeff=1.00)], "-25,12", "90")
+    assert status == "ok", details
+    status, details = _parser._check_integral_rows([dict(row, integral_coeff=1.34)], "-25,12", "90")
+    assert status == "bad", details

@@ -24,6 +24,7 @@ from src.utils.app_paths import (
     get_reference_dir,
     get_resource_roots,
 )
+from src.extractors.act_pages import act_text, continuation_page_indices
 
 # Зашитые дефолты на случай, если справочные CSV в reference/ отсутствуют
 # (например до первого копирования бандла). Основной, редактируемый на
@@ -48,6 +49,12 @@ _DEFAULT_INTEGRAL_PARTY_KEYWORDS = (
     "дефект",  # дефектоскопия, "дефект.и толщин."
     "толщинометри",
     "спецкаб",  # работы спецкабелем — угол не влияет (эмпирически, реальные акты)
+    # Работы на поверхности при ПВР — угол не влияет: в реальных актах
+    # 12271, 13096, 13102 (угол 30-70°, скважинные строки 1.15) эти строки
+    # идут с 1.00, а в 000086 (мороз) — с тем же 1.17, что и услуги партии.
+    "получение",  # "Получение перфораторных зарядов", "Получение зарядов АДС, ПГД/БК, ПГРИ"
+    "снаряжение",  # "Снаряжение перфоратора ПНКТ"
+    "работаперфораторнойпартии",
 )
 
 _contract_coefficients_cache: dict | None = None
@@ -169,6 +176,38 @@ class WellData:
     # для сверки с той же расценкой в таблице расценок акт-наряда (стр.1).
     # Обе величины в одних единицах (100 м).
     page2_spo: str = ""
+    # "Температура воздуха, гр" со страницы "АКТ-ЗАКАЗ" — сверяется с
+    # температурой титульного листа (см. _check_temperature_zakaz). Только
+    # с текстового слоя: на сканах значение вписано от руки и OCR его не
+    # читает (проверено на 28 реальных актах — ни одного верного числа).
+    page2_temperature: str = ""
+    # Реквизиты со страницы "АКТ-ЗАКАЗ" (заказ, скважина, куст, забой, угол,
+    # задача) — сверяются с титульным листом (_check_requisites_zakaz).
+    # Тоже только с текстового слоя.
+    page2_requisites: dict = field(default_factory=dict)
+    # True — даты "АКТ-ЗАКАЗА" прочитаны OCR со скана (а не из текстового
+    # слоя): время на сканах вписано от руки и распознаётся ненадёжно.
+    page2_dates_from_ocr: bool = False
+    # Код условий СПО с титульного листа ("Спуск/подъем ... 4 -Через
+    # лубрикатор при отсутствии бригады КРС") — для сверки с "Условия
+    # проведения СПО" акт-заказа.
+    spo_condition_code: str = ""
+    # Допустимые значения СПО по строкам "С/п ..." акт-наряда (в сотнях
+    # метров) — см. _check_volume_spo: справка по зарегистрированному
+    # материалу в одних актах показывает спуск только прибора, в других —
+    # прибора вместе с шаблоном.
+    spo_row_candidates: List[float] = field(default_factory=list)
+    # По каким именно расценкам расходятся объёмы стр.1 и Приложения №1 —
+    # пояснение к проверке "Сравнение объемов", когда суммы не сошлись.
+    volume_diff_details: List[str] = field(default_factory=list)
+    # Часы тех.дежурства по строкам расценок акт-наряда — для сверки с
+    # "Технологическое дежурство, мин" акт-заказа.
+    tech_duty_hours_title: float | None = None
+    # Даты из актов подрядчика ("составили настоящий акт о том, что «04»
+    # сентября 2026 года ...": тех.дежурство, стоянка, недоход) в виде
+    # "ДД.ММ.ГГГГ" — должны попадать в период работ на скважине (см.
+    # _check_contractor_act_dates).
+    contractor_act_dates: List[str] = field(default_factory=list)
     # Результаты доп.проверок, вычисленных в parse_all из строк расценок
     # (барометрия@53, тех.дежурство >4ч, пересечение термометрии 200/500)
     check_results: dict = field(default_factory=dict)
@@ -232,6 +271,19 @@ class WellData:
          lambda self: self._prefix_details(self.check_results.get("spo_zakaz", {"status": "neutral"})),
          "СПО: акт-наряд vs акт-заказ", True),
         ("zayavka", lambda self: self._check_zayavka(), "Сверка с заявкой", True),
+        ("row_cost",
+         lambda self: self._prefix_details(self.check_results.get("row_cost", {"status": "neutral"})),
+         "Стоимость строк (объём × расценка × коэфф.)", True),
+        ("totals",
+         lambda self: self._prefix_details(self.check_results.get("totals", {"status": "neutral"})),
+         "Итоги акта (арифметика)", True),
+        ("filename", lambda self: self._check_filename(), "Имя файла vs акт", True),
+        ("requisites_zakaz", lambda self: self._check_requisites_zakaz(),
+         "Реквизиты: акт-наряд vs акт-заказ", True),
+        ("temperature_zakaz", lambda self: self._check_temperature_zakaz(),
+         "Температура: акт-наряд vs акт-заказ", True),
+        ("contractor_act_date", lambda self: self._check_contractor_act_dates(),
+         "Дата акта подрядчика vs период работ", True),
         ("temperature", lambda self: self._check_temperature(), "Температура", False),
         ("km", lambda self: self._check_km(), "Километраж", False),
     )
@@ -302,6 +354,7 @@ class WellData:
         spo_table = self._to_float(self.spo)
         if spo_act is None or spo_table is None:
             return {"status": "neutral"}
+        raw_act = spo_act
         if abs(spo_act) < 1000 <= abs(spo_table):
             spo_act = spo_act * 100
         elif abs(spo_act) >= 1000 > abs(spo_table):
@@ -312,14 +365,41 @@ class WellData:
                 return int(math.floor(value + 0.5))
             return int(math.ceil(value - 0.5))
 
-        match = _round_half_up(spo_act) == _round_half_up(spo_table)
-        return {
-            "status": "ok" if match else "bad",
-            "details": [
-                f"    СПО в акте = {spo_act:.2f}",
-                f"    СПО в таблице = {spo_table:.2f}",
-            ],
-        }
+        # На титуле СПО — в сотнях метров с двумя знаками (60,63 = 6063 м,
+        # дробная часть метра отброшена), в справке — с долями метра
+        # (6063,53): сравнение округлённых значений давало ложное
+        # расхождение (акты 000081, 000082, 000085). Допуск — меньше метра.
+        match = _round_half_up(spo_act) == _round_half_up(spo_table) or abs(spo_act - spo_table) < 1.0
+        if not match and abs(raw_act * 100 - spo_table) < 1.0:
+            # Короткий спуск: на титуле 0,23 (сотни метров), в справке 23,20 м —
+            # порог "справка ≥ 1000" выше не сработал, и 0,23 сравнивалось с
+            # 23,20 как есть (акты задачи 24: 12486, 12488, 12501, 12510...).
+            spo_act = raw_act * 100
+            match = True
+        details = [
+            f"    СПО в акте = {spo_act:.2f}",
+            f"    СПО в таблице = {spo_table:.2f}",
+        ]
+        if not match:
+            # В справке СПО иногда — спуск прибора вместе с шаблоном (акт
+            # 000080: 32,22 + 62,00 = 94,22 при 9422,05 в справке), а
+            # self.volume — только первая строка "С/п скв.приб".
+            for candidate in self.spo_row_candidates:
+                candidate_m = candidate * 100
+                if abs(candidate_m - spo_table) < 1.0:
+                    match = True
+                    details[0] = f"    СПО в акте = {candidate_m:.2f} (сумма строк С/п прибора и шаблона)"
+                    break
+        if not match and spo_table < 20 and raw_act * 100 >= 500:
+            # Из справки прочитано однозначное число (4,00 при спуске на
+            # 18 972 м — акты 12490, 13030): это не глубина, а соседняя
+            # цифра со скана. Не расхождение, а нераспознанная справка.
+            return {
+                "status": "neutral",
+                "value_text": "значение в справке не распознано — проверьте вручную",
+                "details": details,
+            }
+        return {"status": "ok" if match else "bad", "details": details}
 
     def _check_vm_cost(self) -> dict:
         task = self.vm_task
@@ -344,7 +424,12 @@ class WellData:
         if max_price is None and min_price is None:
             return {"status": "neutral", "label": "Стоимость ВМ", "value_text": "не найдено в таблице"}
 
-        price_ok = min_price is not None and math.isclose(unit_price, min_price, rel_tol=0.0, abs_tol=0.1)
+        # Верной считается цена и при max, и при min плотности (решение
+        # заказчика от 09.10.2026): раньше принималась только "min", и
+        # акты с ценой "при max плотности" получали ложное ❌.
+        matches_max = max_price is not None and math.isclose(unit_price, max_price, rel_tol=0.0, abs_tol=0.1)
+        matches_min = min_price is not None and math.isclose(unit_price, min_price, rel_tol=0.0, abs_tol=0.1)
+        price_ok = matches_max or matches_min
 
         details: List[str] = []
         if price_raw is not None:
@@ -362,6 +447,14 @@ class WellData:
             details.append(f"    Стоимость 1 отв. при max плотности = {self._format_ru(max_price)}")
         if min_price is not None:
             details.append(f"    Стоимость 1 отв. при min плотности = {self._format_ru(min_price)}")
+        if matches_max and matches_min:
+            details.append("    Цена в акте совпадает со справочником")
+        elif matches_max:
+            details.append("    Цена в акте = цена при max плотности")
+        elif matches_min:
+            details.append("    Цена в акте = цена при min плотности")
+        else:
+            details.append("    ❌ Цена в акте не совпадает ни с ценой при max, ни с ценой при min плотности")
 
         return {"status": "ok" if price_ok else "bad", "label": "Цена ВМ", "details": details}
 
@@ -371,13 +464,15 @@ class WellData:
         if vol_sum is None or qty_sum is None:
             return {"status": "neutral"}
         match = math.isclose(vol_sum, qty_sum, rel_tol=0.0, abs_tol=0.1)
-        return {
-            "status": "ok" if match else "bad",
-            "details": [
-                f"    Сумма объемов (стр.1) = {vol_sum:.2f}",
-                f"    Сумма кол-ва (стр.3) = {qty_sum:.2f}",
-            ],
-        }
+        details = [
+            f"    Сумма объемов (стр.1) = {vol_sum:.2f}",
+            f"    Сумма кол-ва (стр.3) = {qty_sum:.2f}",
+        ]
+        if not match:
+            # Одни суммы не говорят, где искать — показываем расценки, по
+            # которым объём в акт-наряде и в Приложении №1 разный.
+            details.extend(f"    {line}" for line in self.volume_diff_details)
+        return {"status": "ok" if match else "bad", "details": details}
 
     def _check_page2_dates(self) -> dict:
         start1 = self.start_date
@@ -387,13 +482,17 @@ class WellData:
         if not start2 or not end2 or "не найдено" in (start2, end2):
             return {"status": "conditional_ok", "value_text": "условно ✅"}
         match = (start1 == start2) and (end1 == end2)
-        return {
-            "status": "ok" if match else "bad",
-            "details": [
-                f"    Начало работ: {start1} / {start2}",
-                f"    Окончание работ: {end1} / {end2}",
-            ],
-        }
+        details = [
+            f"    Начало работ: {start1} / {start2}",
+            f"    Окончание работ: {end1} / {end2}",
+        ]
+        if not match and self.page2_dates_from_ocr and start1[:10] == start2[:10] and end1[:10] == end2[:10]:
+            # Даты совпали, расходится только время, а оно на скане вписано
+            # от руки (акт 12559: OCR дал 06:34 и 00:00 вместо 06:00 и
+            # 11:00) — это не подтверждённое расхождение.
+            details.append("    время со скана распознано ненадёжно — сверьте вручную")
+            return {"status": "conditional_ok", "value_text": "условно ✅ (даты совпали)", "details": details}
+        return {"status": "ok" if match else "bad", "details": details}
 
     def _check_contract_number_page2(self) -> dict:
         """Номер договора: титульный лист (стр.1) vs АКТ-ЗАКАЗ (стр.2) —
@@ -439,6 +538,197 @@ class WellData:
             "details": [f"    {line}" for line in self.zayavka_check_details],
         }
 
+    _FILENAME_RE: ClassVar = re.compile(
+        r'^(?P<act>\d+)_(?P<field>.+)_(?P<a>[^_]+)_(?P<b>[^_]+)_(?P<task>[^_]+)_(?P<order>\d+)(?:\s.*)?$'
+    )
+
+    def _check_filename(self) -> dict:
+        """Имя файла подрядчика ("16003_Месторождение_куст_скважина_задача_
+        заказ.pdf") против реквизитов самого акта. На 139 реальных актах
+        имя всегда соответствует содержимому — расхождение значит, что под
+        этим именем лежит другой акт (или он переименован с ошибкой). Имя
+        не по шаблону (переименовано вручную) — проверка не выполняется."""
+        match = self._FILENAME_RE.match(os.path.splitext(self.filename or "")[0])
+        if not match or not self.act_number:
+            return {"status": "neutral"}
+        details: List[str] = []
+        if self.act_number.lstrip("0") != match.group("act").lstrip("0"):
+            details.append(f"    ❌ № акта: в имени {match.group('act')} / в акте {self.act_number}")
+        if self.order and "не найдено" not in self.order and self.order != match.group("order"):
+            details.append(f"    ❌ Заказ: в имени {match.group('order')} / в акте {self.order}")
+        # Порядок "куст_скважина" и "скважина_куст" в именах встречается оба.
+        if self.well_number and self.bush:
+            in_name = {match.group("a").upper(), match.group("b").upper()}
+            if in_name != {self.well_number.upper(), self.bush.upper()}:
+                details.append(
+                    f"    ❌ Скважина/куст: в имени {match.group('a')}, {match.group('b')} / "
+                    f"в акте {self.well_number}, {self.bush}"
+                )
+        tasks = [task for task in (self.performed_tasks or self.task_number or "").split("+") if task]
+        if tasks and match.group("task") not in tasks:
+            details.append(f"    ❌ Задача: в имени {match.group('task')} / в акте {'+'.join(tasks)}")
+        if details:
+            return {"status": "bad", "details": details}
+        return {"status": "ok"}
+
+    def _check_requisites_zakaz(self) -> dict:
+        """Заказ, скважина, куст, забой, угол наклона и задача: титульный
+        лист vs "АКТ-ЗАКАЗ". Угол здесь важнее всего — от него зависит
+        интегральный коэффициент, а в акт-заказе он подписан заказчиком."""
+        zakaz = self.page2_requisites or {}
+        if not zakaz:
+            return {"status": "neutral"}
+
+        def _num(value) -> float | None:
+            try:
+                return float(str(value).replace(",", ".").replace(" ", ""))
+            except (TypeError, ValueError):
+                return None
+
+        def _text_equal(a: str, b: str) -> bool:
+            return a.strip().upper() == b.strip().upper()
+
+        def _tasks_equal(a: str, b: str) -> bool:
+            from src.extractors.doc_linking import _same_task
+            return any(_same_task(task, b) for task in a.split("+") if task)
+
+        pairs = (
+            ("Заказ", self.order, zakaz.get("order"), _text_equal),
+            ("Скважина", self.well_number, zakaz.get("well"), _text_equal),
+            ("Куст", self.bush, zakaz.get("bush"), _text_equal),
+            ("Задача", self.performed_tasks or self.task_number, zakaz.get("task"), _tasks_equal),
+        )
+        details: List[str] = []
+        bad = False
+        compared = 0
+        for label, title_value, zakaz_value, equal in pairs:
+            title_value = str(title_value or "").strip()
+            zakaz_value = str(zakaz_value or "").strip()
+            if not title_value or not zakaz_value or "не найдено" in title_value:
+                continue
+            compared += 1
+            if not equal(title_value, zakaz_value):
+                bad = True
+                details.append(f"    ❌ {label}: акт-наряд {title_value} / акт-заказ {zakaz_value}")
+
+        angle_title, angle_zakaz = _num(self.angle), _num(zakaz.get("angle"))
+        if angle_title is not None and angle_zakaz is not None:
+            compared += 1
+            if abs(angle_title - angle_zakaz) > 0.011:
+                bad = True
+                details.append(f"    ❌ Угол наклона: акт-наряд {angle_title:g}° / акт-заказ {angle_zakaz:g}°")
+        depth_title, depth_zakaz = _num(self.depth), _num(zakaz.get("depth"))
+        if depth_title is not None and depth_zakaz is not None:
+            compared += 1
+            # На титуле забой целым числом, в акт-заказе — с десятыми.
+            if abs(depth_title - depth_zakaz) > 1.0:
+                bad = True
+                details.append(f"    ❌ Забой: акт-наряд {depth_title:g} м / акт-заказ {depth_zakaz:g} м")
+
+        if compared == 0:
+            return {"status": "neutral"}
+        if not bad:
+            details = [f"    Совпадают (сверено полей: {compared})"]
+        # Код условий СПО — предупреждением, без влияния на статус: в
+        # реальных актах 12673 и 12677 на титуле стоит 3 (через лубрикатор),
+        # а в акт-заказе 4 (через лубрикатор при отсутствии бригады КРС) —
+        # от этого зависит расценка "Услуги партии", но какой из двух
+        # документов считать верным, решает проверяющий.
+        duty_minutes = _num(zakaz.get("tech_duty_minutes"))
+        if self.tech_duty_hours_title and duty_minutes is not None:
+            compared += 1
+            if abs(self.tech_duty_hours_title * 60 - duty_minutes) > 1.0:
+                bad = True
+                details = [line for line in details if "Совпадают" not in line]
+                details.append(
+                    f"    ❌ Тех.дежурство: акт-наряд {self.tech_duty_hours_title:g} ч "
+                    f"({self.tech_duty_hours_title * 60:g} мин) / акт-заказ {duty_minutes:g} мин"
+                )
+            elif not bad:
+                details = [f"    Совпадают (сверено полей: {compared})"]
+        # Инструкция: "Обращаем внимание на «Причины непроизводительных
+        # затрат» внизу на 2-й странице" — выносим их в отчёт, если заполнены.
+        for key, label in (
+            ("idle_contractor", "Время простоев Подрядчика, мин"),
+            ("idle_customer", "Время простоев Заказчика, мин"),
+        ):
+            minutes = _num(zakaz.get(key))
+            if minutes:
+                details.append(f"    ⚠ {label}: {minutes:g}")
+        if zakaz.get("idle_reasons"):
+            details.append(f"    ⚠ Причины непроизводительных затрат: {zakaz['idle_reasons']}")
+        spo_title, spo_zakaz = self.spo_condition_code, str(zakaz.get("spo_condition") or "")
+        if spo_title and spo_zakaz and spo_title != spo_zakaz:
+            details.append(
+                f"    ⚠ Условия СПО: акт-наряд — код {spo_title} / акт-заказ — код {spo_zakaz} (проверьте вручную)"
+            )
+        return {"status": "bad" if bad else "ok", "details": details}
+
+    def _check_temperature_zakaz(self) -> dict:
+        """Температура воздуха: титульный лист vs "АКТ-ЗАКАЗ".
+
+        Сравниваются не сами числа, а диапазон температурного коэффициента:
+        на титульном листе подрядчик ставит 0 при любой температуре без
+        надбавки (в летних актах титул 0, а в акт-заказе +14...+23), зимой —
+        среднее за период (-11,17), тогда как в акт-заказе стоит разовый
+        замер. Расхождение — когда температура акт-заказа даёт другой
+        коэффициент, чем заложенный в акт-наряд (т.е. влияет на оплату)."""
+        def _to_float(value: str) -> float | None:
+            text = str(value or "").replace(",", ".").replace("−", "-").replace("–", "-").replace(" ", "")
+            try:
+                return float(text)
+            except ValueError:
+                return None
+
+        title = _to_float(self.temperature)
+        zakaz = _to_float(self.page2_temperature)
+        if title is None or zakaz is None:
+            return {"status": "neutral"}
+        try:
+            from integral import CoefficientTable
+        except Exception:
+            return {"status": "neutral"}
+        table = CoefficientTable()
+        k_title = table.get_temperature_coefficient(title)
+        k_zakaz = table.get_temperature_coefficient(zakaz)
+        match = math.isclose(k_title, k_zakaz, abs_tol=0.001)
+        line = (
+            f"    акт-наряд {title:g}°C (коэфф. {k_title:.2f}) / "
+            f"акт-заказ {zakaz:g}°C (коэфф. {k_zakaz:.2f})"
+        )
+        if match and not math.isclose(title, zakaz, abs_tol=0.5):
+            line += " — числа разные, но коэффициент тот же"
+        return {"status": "ok" if match else "bad", "details": [line]}
+
+    def _check_contractor_act_dates(self) -> dict:
+        """Дата в акте подрядчика (тех.дежурство, стоянка и т.п.) должна
+        попадать в период работ на скважине с титульного листа. Реальный
+        случай — акт 16003: работы 04-05.10.2026, а в акте о тех.дежурстве
+        стоит «04» сентября 2026 (не тот месяц)."""
+        if not self.contractor_act_dates:
+            return {"status": "neutral"}
+        try:
+            start = datetime.strptime(self.start_date, '%d.%m.%Y %H:%M').date()
+            end = datetime.strptime(self.end_date, '%d.%m.%Y %H:%M').date()
+        except Exception:
+            return {"status": "neutral"}
+        details: List[str] = []
+        bad = False
+        period = f"{start:%d.%m.%Y}–{end:%d.%m.%Y}"
+        for value in self.contractor_act_dates:
+            try:
+                act_day = datetime.strptime(value, '%d.%m.%Y').date()
+            except Exception:
+                continue
+            if start <= act_day <= end:
+                details.append(f"    ✅ дата акта {value} — в периоде работ {period}")
+            else:
+                bad = True
+                details.append(f"    ❌ дата акта {value} — вне периода работ {period}")
+        if not details:
+            return {"status": "neutral"}
+        return {"status": "bad" if bad else "ok", "details": details}
+
     def _check_temperature(self) -> dict:
         """Сверка температуры воздуха в акте со справочником — раньше
         считалась только в пакетном Excel-отчёте (table_parser.
@@ -455,13 +745,15 @@ class WellData:
         status = result.get("status", "neutral")
         if status not in ("ok", "bad"):
             return {"status": status}
-        return {
-            "status": status,
-            "details": [
-                f"    в акте {result['pdf_temp']:.1f}°C, по отчёту {result['avg_temp']:.1f}°C "
-                f"(разница {result['diff']:.1f}°C, допуск 5°C)"
-            ],
-        }
+        line = (
+            f"    в акте {result['pdf_temp']:.1f}°C, по отчёту {result['avg_temp']:.1f}°C "
+            f"(разница {result['diff']:.1f}°C, допуск 5°C)"
+        )
+        if result.get("same_coefficient"):
+            line += f" — температурный коэффициент тот же ({result['k_act']:.2f})"
+        elif status == "bad" and "k_act" in result:
+            line += f" — коэффициент по акту {result['k_act']:.2f}, по отчёту {result['k_report']:.2f}"
+        return {"status": status, "details": [line]}
 
     def _check_km(self) -> dict:
         """Сверка километража (переезды 1/3 гр. дорог, бездорожье) со
@@ -569,6 +861,12 @@ class WellData:
             return {"status": "neutral"}
 
         zakaz_value = self._to_float(zakaz_raw) or 0.0
+        if naryad_value is None and self._has_task_lump_sum_rate(rows):
+            # Задача оплачивается одной договорной расценкой Прейскуранта
+            # (напр. 80(P) — расц. 1364): спуск-подъём в неё уже включён и
+            # отдельной строкой 348 в акт-наряд не выставляется (акты
+            # 12272, 12366, 12379) — сверять не с чем.
+            return {"status": "neutral"}
         naryad_value = naryad_value if naryad_value is not None else 0.0
 
         if naryad_value == 0.0 and zakaz_value == 0.0:
@@ -583,12 +881,52 @@ class WellData:
             ],
         }
 
-    def _check_barometry_task53(self, rows: List[dict]) -> dict:
+    # Договорные расценки Прейскуранта, которыми задача оплачивается
+    # целиком ("Задачи №80(P), №80(S), №53, №42, №58, №86, №86(Н), 86(L),
+    # №87, №87(Н), 87(L) рассчитываются по Прейскуранту цен" — примечание
+    # к Прейскуранту, "Лист1" справочника): 1364...1372 с подномерами и 1400.
+    _TASK_LUMP_SUM_RATES: ClassVar[frozenset] = frozenset({
+        "1364", "1365", "1366", "1367", "1368", "1369", "13691",
+        "1370", "1371", "13711", "1372", "13721", "1400",
+    })
+
+    @classmethod
+    def _has_task_lump_sum_rate(cls, rows: List[dict]) -> bool:
+        return any(str(row.get("rate_number", "")) in cls._TASK_LUMP_SUM_RATES for row in rows)
+
+    def _check_barometry_task53(self, rows: List[dict], appendix_barometry: Optional[bool] = None) -> dict:
+        """Инструкция: "По указанию при 53 задаче проводят барометрию".
+        Барометрия ищется в строках акт-наряда и в Приложении №1
+        ("Выполненный объем исследований и работ"): когда задача оплачена
+        одной договорной расценкой 1366, отдельной строки барометрии в
+        акт-наряде быть не может, и единственное место, где она может быть
+        показана, — Приложение №1 (решение заказчика от 09.10.2026).
+        Если её нет нигде — это предупреждение, не расхождение.
+
+        appendix_barometry: True/False — есть ли барометрия в Приложении
+        №1; None — Приложение не найдено или не читается (скан)."""
         task = str(self.task_number or "").strip()
         if task != "53":
             return {"status": "neutral"}
-        found = any("барометр" in str(row.get("name", "")).lower() for row in rows)
-        return {"status": "ok" if found else "bad"}
+        if any("барометр" in str(row.get("name", "")).lower() for row in rows):
+            return {"status": "ok", "details": ["    барометрия есть в акт-наряде"]}
+        if appendix_barometry:
+            return {"status": "ok", "details": ["    барометрия есть в Приложении №1"]}
+        if appendix_barometry is None and self._has_task_lump_sum_rate(rows):
+            return {
+                "status": "neutral",
+                "value_text": "Приложение №1 не распознано — проверьте вручную",
+            }
+        # Предупреждение, а не расхождение (решение заказчика от 09.10.2026):
+        # по новому договору барометрию не показывают ни в одном акте
+        # задачи 53 (43 из 46 реальных актов) — ❌ на каждом из них только
+        # заслоняло бы настоящие расхождения. На "ИТОГ" не влияет.
+        where = "ни в акт-наряде, ни в Приложении №1" if appendix_barometry is False else "в акт-наряде"
+        return {
+            "status": "conditional_ok",
+            "value_text": "⚠️ предупреждение",
+            "details": [f"    ⚠ барометрии нет {where}"],
+        }
 
     def _check_tech_duty_hours(self, rows: List[dict]) -> dict:
         threshold_hours = 4.0
@@ -686,11 +1024,15 @@ class WellData:
         (стоянка/иное), если он есть."""
         hours = self._tech_duty_hours_from_rows(rows)
         parts = []
+        comment = self.contractor_comment
         if hours:
             hours_str = str(int(hours)) if hours == int(hours) else f"{hours:.2f}".rstrip("0").rstrip(".")
-            parts.append(f"Тех.деж. {hours_str}ч.")
-        if self.contractor_comment:
-            parts.append(self.contractor_comment)
+            duty = f"Тех.деж. {hours_str}ч."
+            parts.append(duty)
+            # Тот же факт уже найден в акте подрядчика — не дублируем.
+            comment = " ".join(comment.replace(duty, " ").split())
+        if comment:
+            parts.append(comment)
         self.contractor_comment = " ".join(parts) if parts else "+"
 
     def _check_thermometry_overlap(self, rows: List[dict]) -> dict:
@@ -724,7 +1066,9 @@ class WellData:
                     )
 
         if overlaps:
-            return {"status": "bad", "details": overlaps}
+            # Одинаковые строки акта (повторный замер тем же интервалом)
+            # дают одинаковые пары — показываем каждую один раз.
+            return {"status": "bad", "details": list(dict.fromkeys(overlaps))}
         return {
             "status": "ok",
             "details": [f"Пересечений не найдено (М1:200: {len(intervals_200)}, М1:500: {len(intervals_500)})"],
@@ -856,7 +1200,11 @@ class FinalUnifiedParser:
                     header_idx = 0
                 prilozhenie_idx = self._find_page_index(pdf, ("Приложение №1", "Приложение N1", "Приложение N°1"))
 
-                text = pdf.pages[header_idx].extract_text() if pdf.pages else ""
+                # Титульный лист может не уместиться на одной странице —
+                # итоги ("Всего к оплате" и т.д.) и хвост таблицы расценок
+                # тогда лежат на следующем листе (см. act_pages).
+                continuation_idx = continuation_page_indices(pdf, header_idx)
+                text = act_text(pdf, header_idx)
                 all_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
 
                 filename = os.path.basename(pdf_path)
@@ -864,7 +1212,9 @@ class FinalUnifiedParser:
                 # Вычисляем vm_count один раз (используется дважды)
                 vm_count_val = self._parse_vm_count(all_text)
                 # OCR страницы со сканом «АКТ-ЗАКАЗ» вызывается один раз
-                scan_candidates = self._resolve_scan_candidates(pdf, header_idx, prilozhenie_idx)
+                scan_candidates = self._resolve_scan_candidates(
+                    pdf, header_idx, prilozhenie_idx, continuation_idx
+                )
                 page2_start, page2_end, scan_idx = self._parse_page2_start_end(pdf, scan_candidates)
                 vm_table_page_idx = scan_idx if scan_idx is not None else (
                     scan_candidates[0] if scan_candidates else header_idx + 1
@@ -894,6 +1244,8 @@ class FinalUnifiedParser:
                 )
 
                 well_data.task_number = self._parse_task_number(text)
+                spo_code = re.search(r'Спуск/подъем[ .…]*(\d)\s*-', text)
+                well_data.spo_condition_code = spo_code.group(1) if spo_code else ""
                 well_data.contract_number = self._parse_contract_number(text)
                 well_data.contract_coeff_value = self._parse_contract_coefficient_from_act(text)
                 well_data.well_number, well_data.bush = self._parse_well_and_bush(text)
@@ -904,13 +1256,47 @@ class FinalUnifiedParser:
                 ocr_task, well_data.contractor_comment, well_data.perforation_spec = (
                     self._parse_zayavka_and_comment(pdf)
                 )
+                well_data.contractor_act_dates = self._parse_contractor_act_dates(pdf)
                 if self._task_number_plausible(ocr_task, well_data.performed_tasks):
+                    # Суффикс "(S)"/"(P)" со скана заявки OCR обычно теряет —
+                    # если номер совпал с задачей из шапки акта, берём её
+                    # написание целиком ("35" -> "35(S)").
+                    if "(" not in ocr_task:
+                        for task in well_data.performed_tasks.split("+"):
+                            if "(" in task and task.split("(")[0] == ocr_task:
+                                ocr_task = task
+                                break
                     well_data.embedded_zayavka_task = ocr_task
                 if scan_idx is not None and scan_idx < len(pdf.pages):
+                    try:
+                        scan_text = pdf.pages[scan_idx].extract_text() or ""
+                    except Exception:
+                        scan_text = ""
+                    well_data.page2_dates_from_ocr = "Начало работ" not in scan_text
                     well_data.page2_contract_number = self._parse_contract_number_page2(pdf.pages[scan_idx])
                     well_data.page2_spo = self._parse_spo_zakaz(pdf.pages[scan_idx])
+                    well_data.page2_temperature = self._parse_temperature_zakaz(pdf.pages[scan_idx])
+                    well_data.page2_requisites = self._parse_requisites_zakaz(pdf.pages[scan_idx])
 
-                rate_rows = self._extract_rate_rows_page1(pdf, header_idx)
+                all_rate_rows = self._collect_rate_rows(pdf, header_idx, continuation_idx)
+                rate_rows = self._dedupe_rate_rows(all_rate_rows)
+                well_data.spo_row_candidates = self._spo_row_candidates(all_rate_rows)
+                appendix_volumes = self._parse_appendix_volumes(pdf, prilozhenie_idx)
+                well_data.volume_diff_details = self._volume_diff_by_rate(all_rate_rows, appendix_volumes)
+                scope_volume = self._appendix_scope_volume(all_rate_rows)
+                if scope_volume is not None:
+                    well_data.volume_sum_page1 = f"{scope_volume:.2f}" if scope_volume > 0 else ""
+                    lump_rates = {
+                        str(row.get("rate_number", "")) for row in all_rate_rows
+                        if str(row.get("rate_number", "")) in WellData._TASK_LUMP_SUM_RATES
+                    }
+                    if lump_rates and appendix_volumes and not (lump_rates & set(appendix_volumes)):
+                        # Задача выставлена одной договорной расценкой (напр.
+                        # 1366), а в Приложении №1 расписаны фактические
+                        # замеры (ЛМ, ГК...) — объёмы несопоставимы (акт 12453).
+                        well_data.volume_sum_page1 = ""
+                well_data.check_results["row_cost"] = self._check_row_costs(all_rate_rows)
+                well_data.check_results["totals"] = self._check_act_totals(all_rate_rows, text)
                 rate_status, rate_details = self._check_rate_prices_from_rows(rate_rows)
                 well_data.rate_check_status = rate_status
                 well_data.rate_check_details = rate_details
@@ -924,12 +1310,15 @@ class FinalUnifiedParser:
                 well_data.integral_row_status = integral_status
                 well_data.integral_row_details = integral_details
 
-                well_data.check_results["barometry_task53"] = well_data._check_barometry_task53(rate_rows)
+                well_data.check_results["barometry_task53"] = well_data._check_barometry_task53(
+                    rate_rows, self._appendix_has_barometry(pdf, prilozhenie_idx, appendix_volumes)
+                )
                 well_data.check_results["tech_duty"] = well_data._check_tech_duty_hours(rate_rows)
                 well_data.check_results["hours_vs_duration"] = well_data._check_billed_hours_vs_duration(rate_rows)
                 well_data.check_results["thermometry_overlap"] = well_data._check_thermometry_overlap(rate_rows)
                 well_data.check_results["interval_length"] = well_data._check_interval_length(rate_rows)
                 well_data.check_results["spo_zakaz"] = well_data._check_spo_zakaz(rate_rows)
+                well_data.tech_duty_hours_title = well_data._tech_duty_hours_from_rows(all_rate_rows)
                 well_data._finalize_contractor_comment(rate_rows)
 
                 if well_data.start_date == "не найдено" or well_data.end_date == "не найдено":
@@ -1233,9 +1622,11 @@ class FinalUnifiedParser:
     def _load_party_keywords(self) -> tuple:
         """Ключевые слова для классификации строк расценок (влияет ли угол
         наклона на интегральный коэффициент строки) — редактируемый
-        справочник reference/integral_party_keywords.csv. Если файла нет
-        (например на чистой установке до первого копирования бандла) —
-        используется зашитый по умолчанию список."""
+        справочник reference/integral_party_keywords.csv, дополняющий
+        зашитый по умолчанию список. Именно дополняющий, а не заменяющий:
+        справочник в рантайм-папке копируется из бандла один раз и при
+        обновлении программы не перезаписывается, поэтому новые ключевые
+        слова из кода иначе не доходили бы до уже установленных копий."""
         if self._party_keywords_cache is not None:
             return self._party_keywords_cache
 
@@ -1249,7 +1640,8 @@ class FinalUnifiedParser:
                     if str(value).strip()
                 )
                 if keywords:
-                    self._party_keywords_cache = keywords
+                    extra = tuple(k for k in _DEFAULT_INTEGRAL_PARTY_KEYWORDS if k not in keywords)
+                    self._party_keywords_cache = keywords + extra
                     return self._party_keywords_cache
             except Exception:
                 pass
@@ -1258,8 +1650,16 @@ class FinalUnifiedParser:
         return self._party_keywords_cache
 
     def _extract_rate_rows_from_table(self, table: list) -> List[dict]:
+        return self._scan_rate_table(table)[0]
+
+    def _scan_rate_table(self, table: list, inherited_columns: dict | None = None) -> tuple:
+        """Строки расценок одной таблицы. Возвращает (rows, columns,
+        finished): columns — найденная раскладка колонок, finished — дошли
+        ли до итогового блока. Оба нужны, когда таблица продолжается на
+        следующем листе: там шапка обычно не повторяется, и раскладка
+        берётся с титульного листа (inherited_columns)."""
         if not table:
-            return []
+            return [], inherited_columns, False
 
         header_idx = None
         name_col = 0
@@ -1269,6 +1669,7 @@ class FinalUnifiedParser:
         norm_col = None
         coeff_col = None
         spent_col = None
+        cost_col = None
         interval_from_col = None
         interval_to_col = None
         unit_col = None
@@ -1292,6 +1693,8 @@ class FinalUnifiedParser:
                     coeff_col = col_idx
                 if "затрат" in norm and "времен" in norm:
                     spent_col = col_idx
+                if "стоимость" in norm and "работ" in norm:
+                    cost_col = col_idx
                 if "единица" in norm and "измерен" in norm:
                     unit_col = col_idx
             if number_col is not None and price_col is not None:
@@ -1327,12 +1730,42 @@ class FinalUnifiedParser:
                 norm_col = 6
                 coeff_col = 8
                 spent_col = 9
+                cost_col = 10
                 interval_from_col = 3
                 interval_to_col = 4
                 unit_col = 2
+            elif inherited_columns:
+                # Лист-продолжение без шапки: данные идут с первой строки.
+                header_idx = -1
+                name_col = inherited_columns["name"]
+                number_col = inherited_columns["number"]
+                price_col = inherited_columns["price"]
+                volume_col = inherited_columns["volume"]
+                norm_col = inherited_columns["norm"]
+                coeff_col = inherited_columns["coeff"]
+                spent_col = inherited_columns["spent"]
+                cost_col = inherited_columns.get("cost")
+                interval_from_col = inherited_columns["interval_from"]
+                interval_to_col = inherited_columns["interval_to"]
+                unit_col = inherited_columns["unit"]
             else:
-                return []
+                return [], None, False
 
+        columns = {
+            "name": name_col,
+            "number": number_col,
+            "price": price_col,
+            "volume": volume_col,
+            "norm": norm_col,
+            "coeff": coeff_col,
+            "spent": spent_col,
+            "cost": cost_col,
+            "interval_from": interval_from_col,
+            "interval_to": interval_to_col,
+            "unit": unit_col,
+        }
+        finished = False
+        block_start = 0
         rows: List[dict] = []
         stop_markers = (
             "итого по акт",
@@ -1351,8 +1784,38 @@ class FinalUnifiedParser:
 
             norm_row = self._normalize_for_match(row_text)
             if any(marker in norm_row for marker in stop_markers):
+                finished = True
                 break
             if "наименование работ" in norm_row:
+                continue
+
+            if row_text.lstrip().startswith("Стоимость"):
+                # Строка-подытог блока. У работ на спецкабеле (реальные акты
+                # 000079, 12303) скважинные исследования к оплате не
+                # предъявляются — оплачивается только интерпретация: в
+                # строке "...с интегральным коэффициентом:" тогда стоит одно
+                # число (затраты времени) вместо двух (время и сумма), и в
+                # "Итого по акт-наряду" эти строки не входят.
+                billed = True
+                for line in row_text.splitlines():
+                    if "с интегральным коэффициентом" in line:
+                        numbers = re.findall(
+                            r'(?<![\d,])\d{1,3}(?: \d{3})*,\d{1,2}(?!\d)', line.split(":", 1)[-1]
+                        )
+                        billed = len(numbers) >= 2
+                norm_total = norm_row
+                if "скважинных исследований" in norm_total:
+                    block = "research"
+                elif "договорных" in norm_total:
+                    block = "contract"
+                elif "проезда" in norm_total:
+                    block = "travel"
+                else:
+                    block = "extra"
+                for block_row in rows[block_start:]:
+                    block_row["billed"] = billed
+                    block_row["block"] = block
+                block_start = len(rows)
                 continue
 
             if number_col is None or number_col >= len(row):
@@ -1380,6 +1843,10 @@ class FinalUnifiedParser:
             spent_value = None
             if spent_col is not None and spent_col < len(row):
                 spent_value = self._parse_decimal(row[spent_col])
+
+            cost_value = None
+            if cost_col is not None and cost_col < len(row):
+                cost_value = self._parse_decimal(row[cost_col])
 
             interval_from_value = None
             if interval_from_col is not None and interval_from_col < len(row):
@@ -1410,22 +1877,43 @@ class FinalUnifiedParser:
                     "norm_time": round(norm_value, 2) if norm_value is not None else None,
                     "integral_coeff": round(coeff_value, 4) if coeff_value is not None else None,
                     "spent_time": round(spent_value, 2) if spent_value is not None else None,
+                    "cost": round(cost_value, 2) if cost_value is not None else None,
                     "interval_from": round(interval_from_value, 2) if interval_from_value is not None else None,
                     "interval_to": round(interval_to_value, 2) if interval_to_value is not None else None,
                 }
             )
 
-        return rows
+        return rows, columns, finished
 
-    def _extract_rate_rows_page1(self, pdf, page_idx: int = 0) -> List[dict]:
+    def _extract_rate_rows_page1(self, pdf, page_idx: int = 0, continuation_idx=()) -> List[dict]:
+        return self._dedupe_rate_rows(self._collect_rate_rows(pdf, page_idx, continuation_idx))
+
+    def _collect_rate_rows(self, pdf, page_idx: int = 0, continuation_idx=()) -> List[dict]:
+        """Все строки расценок как в акте, включая полностью одинаковые
+        (один и тот же замер, записанный несколько раз) — нужны там, где
+        важна сумма (арифметика итогов); для построчных сверок одинаковые
+        строки схлопываются в _dedupe_rate_rows."""
         if not pdf.pages or page_idx >= len(pdf.pages):
             return []
-        page = pdf.pages[page_idx]
-        tables = page.extract_tables() or []
         rows: List[dict] = []
-        for table in tables:
-            rows.extend(self._extract_rate_rows_from_table(table))
+        columns = None
+        finished = False
+        # Титульный лист, затем листы-продолжения (если таблица расценок
+        # не уместилась на одной странице) — до итогового блока.
+        for idx in (page_idx, *continuation_idx):
+            if finished or idx >= len(pdf.pages):
+                break
+            for table in pdf.pages[idx].extract_tables() or []:
+                table_rows, table_columns, table_finished = self._scan_rate_table(table, columns)
+                rows.extend(table_rows)
+                if table_columns:
+                    columns = table_columns
+                if table_finished:
+                    finished = True
+                    break
+        return rows
 
+    def _dedupe_rate_rows(self, rows: List[dict]) -> List[dict]:
         unique_rows: List[dict] = []
         seen: set[tuple] = set()
         for row in rows:
@@ -1607,6 +2095,262 @@ class FinalUnifiedParser:
         status = "bad" if status_is_bad else "ok"
         return status, summary_lines + details
 
+    def _parse_appendix_volumes(self, pdf, page_idx: Optional[int]) -> dict:
+        """{номер расценки: сумма "Всего"} из таблицы Приложения №1."""
+        if page_idx is None or page_idx >= len(pdf.pages):
+            return {}
+        try:
+            tables = pdf.pages[page_idx].extract_tables() or []
+        except Exception:
+            return {}
+        for table in tables:
+            number_col = total_col = None
+            header_idx = None
+            for idx, row in enumerate(table[:5]):
+                for col_idx, cell in enumerate(row or []):
+                    norm = self._normalize_for_match(cell)
+                    if "номер" in norm and "расцен" in norm:
+                        number_col = col_idx
+                    if "всего" in norm:
+                        total_col = col_idx
+                        header_idx = idx
+            if number_col is None or total_col is None:
+                continue
+            volumes: dict = {}
+            for row in table[header_idx + 1:]:
+                if not row or max(number_col, total_col) >= len(row):
+                    continue
+                number = self._normalize_rate_number(row[number_col])
+                total = self._parse_decimal(row[total_col])
+                if number and total is not None:
+                    volumes[number] = volumes.get(number, 0.0) + total
+            if volumes:
+                return volumes
+        return {}
+
+    # Блоки акт-наряда, строки которых перечисляются в Приложении №1
+    # ("Выполненный объем исследований и работ"): скважинные исследования
+    # и договорные расценки Прейскуранта. Доп.работы и проезд — нет.
+    _APPENDIX_BLOCKS: ClassVar[tuple] = ("research", "contract")
+
+    def _appendix_scope_volume(self, rows: List[dict]) -> float | None:
+        """Сумма объёмов строк акт-наряда, которые должны быть в Приложении
+        №1. None — блоки не размечены (нет строк-подытогов).
+
+        Раньше сумма бралась из текста до ПЕРВОГО подытога: если в акте
+        есть и скважинные исследования, и договорные расценки (акты 12303,
+        13031, 13248, 12545), вторые в сумму не попадали, а в Приложении
+        №1 они есть — отсюда ложное расхождение."""
+        if not any(row.get("block") for row in rows):
+            return None
+        return sum(
+            float(row["volume"]) for row in rows
+            if row.get("block") in self._APPENDIX_BLOCKS and isinstance(row.get("volume"), (int, float))
+        )
+
+    def _appendix_has_barometry(self, pdf, page_idx: Optional[int], appendix_volumes: dict) -> Optional[bool]:
+        """Есть ли барометрия в Приложении №1: по названию работы в тексте
+        страницы или по расценке 301 ("Барометрия скв. Запись точечная").
+        None — страницы нет либо она без текстового слоя (скан)."""
+        if page_idx is None or page_idx >= len(pdf.pages):
+            return None
+        try:
+            text = pdf.pages[page_idx].extract_text() or ""
+        except Exception:
+            text = ""
+        if not text.strip() and not appendix_volumes:
+            return None
+        return "барометр" in text.lower() or "301" in appendix_volumes
+
+    def _volume_diff_by_rate(self, rows: List[dict], appendix: dict) -> List[str]:
+        """Расценки блоков "скважинные исследования" и "договорные
+        расценки" акт-наряда, у которых объём не совпадает с Приложением №1."""
+        if not appendix:
+            return []
+        title: dict = {}
+        names: dict = {}
+        for row in rows:
+            if row.get("block") not in self._APPENDIX_BLOCKS or not isinstance(row.get("volume"), (int, float)):
+                continue
+            number = str(row.get("rate_number", ""))
+            title[number] = title.get(number, 0.0) + float(row["volume"])
+            names.setdefault(number, str(row.get("name", ""))[:40])
+        if not title:
+            return []
+        lines: List[str] = []
+        for number in sorted(set(title) | set(appendix)):
+            in_title, in_appendix = title.get(number), appendix.get(number)
+            label = f"расц. {self._format_rate_number(number)}"
+            if number in names:
+                label += f" ({names[number]})"
+            if in_title is None:
+                lines.append(f"❌ {label}: в Приложении №1 {in_appendix:.2f}, в акт-наряде строки нет")
+            elif in_appendix is None:
+                lines.append(f"❌ {label}: в акт-наряде {in_title:.2f}, в Приложении №1 строки нет")
+            elif abs(in_title - in_appendix) > 0.05:
+                lines.append(f"❌ {label}: акт-наряд {in_title:.2f} / Приложение №1 {in_appendix:.2f}")
+        return lines
+
+    def _spo_row_candidates(self, rows: List[dict]) -> List[float]:
+        """Суммы объёмов строк спуско-подъёма: прибор + шаблон и все
+        строки "С/п" вместе (в сотнях метров)."""
+        tool_and_template = 0.0
+        total = 0.0
+        for row in rows:
+            volume = row.get("volume")
+            if not isinstance(volume, (int, float)):
+                continue
+            norm = self._normalize_for_match(row.get("name", "")).replace(" ", "")
+            if not norm.startswith("с/п"):
+                continue
+            total += float(volume)
+            if "скв.приб" in norm or "шаблон" in norm:
+                tool_and_template += float(volume)
+        return [round(value, 2) for value in dict.fromkeys((tool_and_template, total)) if value > 0]
+
+    def _check_row_costs(self, rows: List[dict]) -> dict:
+        """Стоимость строки = объём × расценка × интегральный коэффициент.
+        На 1202 строках 139 реальных актов выполняется без единого
+        исключения — любое расхождение значит, что сумма в строке
+        посчитана не из показанных в ней же чисел."""
+        details: List[str] = []
+        checked = 0
+        for row in rows:
+            volume, price, cost = row.get("volume"), row.get("rate_price"), row.get("cost")
+            coeff = row.get("integral_coeff")
+            if not all(isinstance(v, (int, float)) for v in (volume, price, cost, coeff)):
+                continue
+            checked += 1
+            expected = float(volume) * float(price) * float(coeff)
+            if abs(expected - float(cost)) > max(0.06, abs(float(cost)) * 0.0005):
+                name = str(row.get("name", ""))
+                name_short = name if len(name) <= 60 else f"{name[:57]}..."
+                details.append(
+                    f"❌ {name_short} | №{self._format_rate_number(str(row.get('rate_number', '')))} | "
+                    f"{self._format_ru_decimal(float(volume))} × {self._format_ru_decimal(float(price))} × "
+                    f"{float(coeff):.2f} = {self._format_ru_decimal(expected)}, в акте "
+                    f"{self._format_ru_decimal(float(cost))}"
+                )
+        if checked == 0:
+            return {"status": "neutral"}
+        if details:
+            return {"status": "bad", "details": details}
+        return {"status": "ok", "details": [f"Строк проверено: {checked}, все сходятся"]}
+
+    _MONEY_RE: ClassVar = re.compile(r'(?<![\d,])\d{1,3}(?: \d{3})*,\d{2}(?!\d)')
+
+    def _line_money(self, text: str, marker: str) -> tuple:
+        """(последняя сумма в строке с marker, сама строка) — сумма с двумя
+        знаками после запятой; перед ней в строке может стоять итог по
+        времени ("И т о г о по Акт-наpяду 573,3 161 623,45")."""
+        for line in text.splitlines():
+            if marker in line:
+                tail = line.split(marker, 1)[1]
+                found = self._MONEY_RE.findall(tail)
+                value = self._parse_decimal(found[-1]) if found else None
+                return value, tail.strip()
+        return None, ""
+
+    def _check_act_totals(self, rows: List[dict], text: str) -> dict:
+        """Арифметика итогового блока титульного листа:
+          1) "И т о г о по Акт-наряду" = сумма стоимостей всех строк;
+          2) "Всего с учетом коэффициента" = (Всего по Акт-наряду −
+             договорные расценки Прейскуранта) × K + договорные расценки —
+             коэффициент по договору на Прейскурант не начисляется (на 138
+             реальных актах из 138 формула сходится до копейки);
+          3) "Всего к оплате" = "Всего с учетом коэффициента" + стоимость ВМ
+             и расходных материалов."""
+        def money(value: float) -> str:
+            return self._format_ru_decimal(value)
+
+        def same(a: float, b: float) -> bool:
+            return abs(a - b) <= 0.06
+
+        costs = [row["cost"] for row in rows if isinstance(row.get("cost"), (int, float))]
+        if not costs:
+            return {"status": "neutral"}
+        details: List[str] = []
+        bad = False
+
+        unbilled_sum = sum(
+            row["cost"] for row in rows
+            if isinstance(row.get("cost"), (int, float)) and row.get("billed") is False
+        )
+        rows_sum = sum(costs) - unbilled_sum
+        itogo, itogo_tail = self._line_money(text, "по Акт-наp")
+        if itogo is None:
+            itogo, itogo_tail = self._line_money(text, "о г о по Акт")
+        if itogo_tail:
+            # Итог по времени без дробной части может слиться с суммой
+            # ("246 118 774,82") — тогда сверяем по окончанию строки.
+            glued = itogo_tail.replace(" ", "").endswith(f"{rows_sum:.2f}".replace(".", ","))
+            if (itogo is not None and same(itogo, rows_sum)) or glued:
+                note = ""
+                if unbilled_sum:
+                    note = (
+                        f" (скважинные исследования {money(unbilled_sum)} к оплате не предъявлены — "
+                        "только интерпретация)"
+                    )
+                details.append(f"✅ Итого по акт-наряду: сумма строк {money(rows_sum)}{note}")
+            else:
+                bad = True
+                shown = money(itogo) if itogo is not None else itogo_tail
+                details.append(f"❌ Итого по акт-наряду: сумма строк {money(rows_sum)}, в акте {shown}")
+
+        total_act, _ = self._line_money(text, "Всего по Акт-наряду")
+        coeff_match = re.search(
+            r'Всего с учетом коэффициента\s+(\d+[,.]\d+)\s+(\d[\d ]*,\d{2})', text
+        )
+        total_k = None
+        if total_act is not None and coeff_match:
+            k = self._parse_decimal(coeff_match.group(1))
+            total_k = self._parse_decimal(coeff_match.group(2))
+            codes = self._load_prayskurant_codes()
+            contract_sum = sum(
+                row["cost"] for row in rows
+                if isinstance(row.get("cost"), (int, float)) and str(row.get("rate_number", "")) in codes
+            )
+            if k is not None and total_k is not None:
+                expected = (total_act - contract_sum) * k + contract_sum
+                formula = f"({money(total_act)} − {money(contract_sum)}) × {k:.3f} + {money(contract_sum)}"
+                if contract_sum == 0:
+                    formula = f"{money(total_act)} × {k:.3f}"
+                if same(expected, total_k):
+                    details.append(f"✅ С учётом коэффициента: {formula} = {money(total_k)}")
+                else:
+                    bad = True
+                    details.append(
+                        f"❌ С учётом коэффициента: {formula} = {money(expected)}, в акте {money(total_k)}"
+                    )
+                    if contract_sum and same(total_act * k, total_k):
+                        details.append(
+                            "   коэффициент начислен и на договорные расценки Прейскуранта "
+                            f"({money(contract_sum)}) — на них он не распространяется"
+                        )
+
+        to_pay, _ = self._line_money(text, "Всего к оплате")
+        if to_pay is not None and total_k is not None:
+            materials = 0.0
+            block = re.search(r'Стоимость ВМ(.*?)Всего к оплате', text, re.DOTALL)
+            if block:
+                for line in block.group(1).splitlines()[:1] + [
+                    ln for ln in block.group(1).splitlines() if "Стоимость расходных" in ln
+                ]:
+                    found = self._MONEY_RE.findall(line)
+                    if found:
+                        materials += self._parse_decimal(found[-1]) or 0.0
+            expected = total_k + materials
+            formula = money(total_k) if not materials else f"{money(total_k)} + ВМ/материалы {money(materials)}"
+            if same(expected, to_pay):
+                details.append(f"✅ Всего к оплате: {formula} = {money(to_pay)}")
+            else:
+                bad = True
+                details.append(f"❌ Всего к оплате: {formula} = {money(expected)}, в акте {money(to_pay)}")
+
+        if not details:
+            return {"status": "neutral"}
+        return {"status": "bad" if bad else "ok", "details": details}
+
     def _classify_integral_work_type(self, name: str) -> str:
         norm = re.sub(r"\s+", "", name.lower())
         for keyword in self._load_party_keywords():
@@ -1638,10 +2382,16 @@ class FinalUnifiedParser:
         details: List[str] = []
         ok_count = 0
         bad_count = 0
+        skipped_no_angle = 0
 
         for row in rows:
             actual = row.get("integral_coeff")
             if not isinstance(actual, (int, float)):
+                continue
+            # Строки, не предъявленные к оплате (скважинные исследования при
+            # работе на спецкабеле — см. _scan_rate_table): коэффициент в
+            # них на сумму акта не влияет, сверять его не с чем.
+            if row.get("billed") is False:
                 continue
 
             name = str(row.get("name", "")).strip()
@@ -1657,6 +2407,7 @@ class FinalUnifiedParser:
                 expected = k_well if work_type == "well" else k_party
                 kind = "скв." if work_type == "well" else "парт."
             if expected is None:
+                skipped_no_angle += 1
                 continue
 
             match = math.isclose(float(actual), float(expected), rel_tol=0.0, abs_tol=0.02)
@@ -1675,6 +2426,12 @@ class FinalUnifiedParser:
 
         status = "bad" if bad_count > 0 else "ok"
         summary = f"Совпало: {ok_count}, расхождений: {bad_count}"
+        if skipped_no_angle:
+            # Акт 13059: поле "Угол наклона" на титуле пустое — скважинные
+            # строки сверить не с чем, и это должно быть видно в отчёте.
+            details.append(
+                f"⚠ Угол наклона в акте не указан — скважинные строки не сверены: {skipped_no_angle}"
+            )
         return status, [summary] + details
 
     # ===== ОСНОВНЫЕ ДАННЫЕ =====
@@ -1703,18 +2460,21 @@ class FinalUnifiedParser:
 
     def _parse_task_number(self, text: str) -> str:
         """Номер задачи (например 53, 87(Р), 500.4, 58.158)"""
-        match = re.search(r'Задача\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)', text)
-        return match.group(1) if match else ""
+        # Суффикс в скобках бывает и кириллицей ("87(Н)", "80(Р)"), и
+        # латиницей ("35(S)", "80(P)") — раньше латинский терялся, и в
+        # реестр уходило "35" вместо "35(S)" (в реестре заказчика — "35(S)").
+        match = re.search(r'Задача\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\s?\([A-Za-zА-Яа-яЁё]+\))?)', text)
+        return match.group(1).replace(" ", "") if match else ""
 
     _ZAYAVKA_TASK_PATTERNS: ClassVar[tuple] = (
         # "ПГИ № 80 (...)" — старый цифровой формат заявки.
-        re.compile(r'ПГИ\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)'),
+        re.compile(r'ПГИ\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\s?\([A-Za-zА-Яа-яЁё]+\))?)'),
         # "Цель (задача) и интервал исследований: № 24 Опр...."
-        re.compile(r'Цель\s*\(задача\)[^\n]{0,60}?№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)'),
+        re.compile(r'Цель\s*\(задача\)[^\n]{0,60}?№\s*([0-9]+(?:\.[0-9]+)?(?:\s?\([A-Za-zА-Яа-яЁё]+\))?)'),
         # "Цель, вид, объем заказываемых работ: 87 Опр...." — без "№".
-        re.compile(r'Цель,?\s*вид,?\s*объем[^\n]{0,40}?:\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)'),
+        re.compile(r'Цель,?\s*вид,?\s*объем[^\n]{0,40}?:\s*([0-9]+(?:\.[0-9]+)?(?:\s?\([A-Za-zА-Яа-яЁё]+\))?)'),
         # общий запасной вариант — как в заголовке акт-наряда/акт-заказа.
-        re.compile(r'Задача\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)'),
+        re.compile(r'Задача\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\s?\([A-Za-zА-Яа-яЁё]+\))?)'),
     )
 
     def _task_number_plausible(self, ocr_task: str, performed_tasks: str) -> bool:
@@ -1758,7 +2518,7 @@ class FinalUnifiedParser:
         for pattern in self._ZAYAVKA_TASK_PATTERNS:
             match = pattern.search(text)
             if match:
-                return match.group(1)
+                return match.group(1).replace(" ", "")
         return ""
 
     # Короткие, самодостаточные факты внутри длинного текста страницы
@@ -1779,7 +2539,11 @@ class FinalUnifiedParser:
         # уходило в сырой fallback ниже. "tex" (латиницей) — частая OCR-
         # ошибка распознавания "Тех" на сканах (напр. акт 13074: "® Tex.
         # дежурство при компрессировании, 3,5 часа.").
-        r'(?:тех[а-я]*|tex)\.?\s*деж[а-я]*[^.]{0,60}?(\d+[.,]?\d*)[^.]{0,20}?час',
+        # Число — то, что стоит непосредственно перед "час", а не первое
+        # попавшееся после "дежурство": в акте 16003 ("...дежурство партии
+        # при проведении ГИС 35(S) составило -4 часа") за часы принимался
+        # номер задачи, и в реестр уходило "Тех.деж. 35ч.".
+        r'(?:тех[а-я]*|tex)\.?\s*деж[а-я]*(?:[^.]|(?<=\d)\.(?=\d)){0,90}?(?<![\d.,(])(\d+(?:[.,]\d+)?)\s*(?:-?\s*х\s*)?час',
         re.IGNORECASE,
     )
 
@@ -2021,8 +2785,8 @@ class FinalUnifiedParser:
         '+' в порядке появления — колонка "Проведенный ГИС" в реестре
         "Проверка акт-нарядов" (в отличие от task_number, берущего только
         первую — она нужна для сверки с заявкой и спецкейса недохода)."""
-        matches = re.findall(r'Задача\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\([А-Яа-я]+\))?)', text)
-        return "+".join(matches)
+        matches = re.findall(r'Задача\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\s?\([A-Za-zА-Яа-яЁё]+\))?)', text)
+        return "+".join(match.replace(" ", "") for match in matches)
 
     def _parse_contract_number(self, text: str) -> str:
         """Номер договора (только числовой формат — учитываются лишь
@@ -2755,14 +3519,18 @@ class FinalUnifiedParser:
                 return idx
         return None
 
-    def _resolve_scan_candidates(self, pdf, header_idx: int, prilozhenie_idx: Optional[int]) -> list:
+    def _resolve_scan_candidates(
+        self, pdf, header_idx: int, prilozhenie_idx: Optional[int], skip_indices=()
+    ) -> list:
         """Список кандидатов в физические страницы для скана «АКТ-ЗАКАЗ»
         (Начало работы на объекте / Окончание работы партии): сначала
         страницы сразу после титульного листа (обычный случай, со сдвигом
         на лист согласования при необходимости), затем — сразу перед ним
         (на случай, если титул не первый, как в 12459_*.pdf)."""
         n = len(pdf.pages)
-        exclude = {header_idx}
+        # skip_indices — листы-продолжения титула (таблица расценок не
+        # уместилась на одной странице): это не скан «АКТ-ЗАКАЗ».
+        exclude = {header_idx, *skip_indices}
         if prilozhenie_idx is not None:
             exclude.add(prilozhenie_idx)
         candidates: list = []
@@ -2884,6 +3652,94 @@ class FinalUnifiedParser:
             return ""
         match = re.search(r'Договор\s*№\s*([0-9A-ZА-Я]+)', text, re.IGNORECASE)
         return match.group(1) if match else ""
+
+    _ZAKAZ_REQUISITE_PATTERNS: ClassVar[tuple] = (
+        ("order", re.compile(r'№\s*Заявки\s*\(Акт-Заказа\)[ \t]*(\d+)')),
+        ("well_bush", re.compile(r'№\s*скважины\s*\|\s*№\s*куста[ \t]*(\S+)[ \t]+(\S+)')),
+        ("depth", re.compile(r'Забой по заявке,\s*м[ \t]*(\d+(?:[.,]\d+)?)')),
+        ("angle", re.compile(r'Максимальный зен\.\s*угол,\s*гр[ \t]*(\d+(?:[.,]\d+)?)')),
+        ("task", re.compile(r'Задача\s*№[ \t]*([0-9]+(?:\.[0-9]+)?(?:\s?\([A-Za-zА-Яа-яЁё]+\))?)')),
+        ("spo_condition", re.compile(r'Условия проведения СПО[ \t]*(\d)\b')),
+        ("tech_duty_minutes", re.compile(r'Технологическое дежурство,\s*мин[ \t]*(\d+)')),
+        ("idle_contractor", re.compile(r'Время простоев Подрядчика,\s*мин[ \t]*(\d+)')),
+        ("idle_customer", re.compile(r'Время простоев Заказчика,\s*мин[ \t]*(\d+)')),
+    )
+
+    def _parse_requisites_zakaz(self, page) -> dict:
+        """Реквизиты со страницы «АКТ-ЗАКАЗ» — только из текстового слоя
+        (на сканах эти поля OCR читает ненадёжно, а ложное расхождение по
+        номеру скважины хуже, чем отсутствие сверки)."""
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        if "АКТ - ЗАКАЗ" not in text and "АКТ-ЗАКАЗ" not in text:
+            return {}
+        result: dict = {}
+        for key, pattern in self._ZAKAZ_REQUISITE_PATTERNS:
+            match = pattern.search(text)
+            if not match:
+                continue
+            if key == "well_bush":
+                result["well"], result["bush"] = match.group(1), match.group(2)
+            else:
+                result[key] = match.group(1).replace(" ", "")
+        reasons = re.search(
+            r'Причины непроизводительных затрат(.*?)ПОДПИСИ ПРЕДСТАВИТЕЛЕЙ', text, re.DOTALL
+        )
+        if reasons:
+            body = " ".join(reasons.group(1).split())
+            if body:
+                result["idle_reasons"] = body[:200]
+        return result
+
+    def _parse_temperature_zakaz(self, page) -> str:
+        """"Температура воздуха, гр" со страницы «АКТ-ЗАКАЗ» — только из
+        текстового слоя (см. комментарий к WellData.page2_temperature)."""
+        try:
+            direct_text = page.extract_text() or ""
+        except Exception:
+            direct_text = ""
+        match = re.search(
+            r'Температура\s+воздуха,?[ \t]*гр\.?[ \t]*([+\-−–]?[ \t]?\d+(?:[.,]\d+)?)', direct_text
+        )
+        if not match:
+            return ""
+        value = match.group(1).replace(" ", "").replace("−", "-").replace("–", "-").lstrip("+")
+        return value.replace(".", ",")
+
+    _RU_MONTHS_GENITIVE: ClassVar[dict] = {
+        "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+        "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+    }
+    _CONTRACTOR_ACT_DATE_RE: ClassVar = re.compile(
+        r'о\s+том,?\s*что\s*[«"“]?\s*(\d{1,2})\s*[»"”]?\s*([а-яё]+)\s*(\d{4})', re.IGNORECASE
+    )
+
+    def _parse_contractor_act_dates(self, pdf) -> List[str]:
+        """Даты из актов подрядчика ("Мы, нижеподписавшиеся ... составили
+        настоящий акт о том, что «04» сентября 2026 года ...") — кроме
+        рутинного акта проверки готовности скважины. Только страницы с
+        текстовым слоем: на сканах день/месяц распознаются ненадёжно, а
+        ложное "дата вне периода работ" хуже, чем отсутствие проверки."""
+        dates: List[str] = []
+        for page in pdf.pages:
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+            if "нижеподписавш" not in text.lower():
+                continue
+            if re.search(r'проверена\s+готовност', text, re.IGNORECASE):
+                continue
+            for day, month_name, year in self._CONTRACTOR_ACT_DATE_RE.findall(text):
+                month = self._RU_MONTHS_GENITIVE.get(month_name.lower())
+                if not month:
+                    continue
+                value = f"{int(day):02d}.{month:02d}.{year}"
+                if value not in dates:
+                    dates.append(value)
+        return dates
 
     def _parse_spo_zakaz(self, page) -> str:
         """"Всего выполнено" по расценке 348 ("Спуск или подъем скв.

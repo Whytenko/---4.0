@@ -5,6 +5,10 @@ import shutil
 import sys
 from pathlib import Path
 
+# Все модули, читающие PDF, импортируют app_paths — подключаем защиту от
+# битых страниц здесь, чтобы она действовала везде, а не в каждом парсере.
+from src.utils import pdf_safe  # noqa: F401
+
 APP_DIR_NAME = "AktNaryadVerifier"
 ENV_HOME_KEY = "AKT_NARYAD_HOME"
 

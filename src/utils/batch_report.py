@@ -57,6 +57,45 @@ def _label_km(km_status: dict) -> str:
     return f"{label}: {compact}"
 
 
+def _label_with_details(check: dict) -> str:
+    """Как _label(), но с цифрами проверки — чтобы из ячейки было видно,
+    что именно с чем не сошлось, не открывая консольный вывод."""
+    label = _label(check.get("status"))
+    details = [line.strip().lstrip("✅❌ ").strip() for line in check.get("details") or []]
+    details = [line for line in details if line]
+    if not details or check.get("status") == "neutral":
+        return label
+    return f"{label}: {'; '.join(details)}"
+
+
+def _label_bad_details(check: dict) -> str:
+    """Подробности только по расхождениям — у этих проверок при "ОК"
+    деталей много (по строке на каждый итог), в ячейке они не нужны."""
+    label = _label(check.get("status"))
+    if check.get("status") != "bad":
+        return label
+    details = [line.strip() for line in check.get("details") or [] if "❌" in line]
+    details = [line.lstrip("❌ ").strip() for line in details]
+    return f"{label}: {'; '.join(details)}" if details else label
+
+
+def _label_warning(check: dict) -> str:
+    """Как _label(), но предупреждение (⚠) показывается своим текстом и
+    жёлтой заливкой, а не как "✅ OK (усл.)" — иначе оно неотличимо от
+    обычного условного совпадения."""
+    warnings = [line.strip().lstrip("⚠ ").strip() for line in check.get("details") or [] if "⚠" in line]
+    if warnings:
+        return f"⚠️ {'; '.join(warnings)}"
+    return _label(check.get("status"))
+
+
+def _label_requisites(check: dict) -> str:
+    """Как _label_bad_details(), плюс предупреждения (⚠) при статусе "ОК"."""
+    text = _label_bad_details(check)
+    warnings = [line.strip() for line in check.get("details") or [] if "⚠" in line]
+    return f"{text}; {'; '.join(warnings)}" if warnings else text
+
+
 def _row_overall(statuses: List[str]) -> str:
     if any(status == "bad" for status in statuses):
         return "❌ ЕСТЬ РАСХОЖДЕНИЯ"
@@ -108,6 +147,12 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
             checks["zayavka"]["status"],
             temp_status["status"],
             km_status["status"],
+            checks["temperature_zakaz"]["status"],
+            checks["contractor_act_date"]["status"],
+            checks["row_cost"]["status"],
+            checks["totals"]["status"],
+            checks["requisites_zakaz"]["status"],
+            checks["filename"]["status"],
         ]
 
         rows.append(
@@ -128,7 +173,7 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
                 "Номер договора (стр.2)": _label(checks["contract_number_page2"]["status"]),
                 "Интеграл. коэфф.": _label(checks["integral"]["status"]),
                 "Коэфф. по договору": _label(checks["contract_coeff"]["status"]),
-                "Барометрия@53": _label(checks["barometry_task53"]["status"]),
+                "Барометрия@53": _label_warning(checks["barometry_task53"]),
                 "Тех.дежурство >4ч": _label(checks["tech_duty"]["status"]),
                 "Часы партии vs продолж.": _label(checks["hours_vs_duration"]["status"]),
                 "Термометрия 200/500": _label(checks["thermometry_overlap"]["status"]),
@@ -144,6 +189,16 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
                 # перфорацию или страница не найдена.
                 "Спецификация перфорации": well_data.perforation_spec,
                 "ИТОГ": _row_overall(statuses),
+                # Новые колонки — намеренно ПОСЛЕ "ИТОГ", в самом конце:
+                # макрос переноса в мастер-реестр копирует "Сводку" по
+                # номерам колонок, и вставка в середину сдвинула бы уже
+                # накопленные там строки относительно заголовков.
+                "Температура (акт-наряд vs акт-заказ)": _label_with_details(checks["temperature_zakaz"]),
+                "Дата акта подрядчика vs период работ": _label_with_details(checks["contractor_act_date"]),
+                "Стоимость строк": _label_bad_details(checks["row_cost"]),
+                "Итоги акта (арифметика)": _label_bad_details(checks["totals"]),
+                "Реквизиты (акт-наряд vs акт-заказ)": _label_requisites(checks["requisites_zakaz"]),
+                "Имя файла vs акт": _label_bad_details(checks["filename"]),
             }
         )
 

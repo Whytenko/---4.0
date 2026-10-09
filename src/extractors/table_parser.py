@@ -222,7 +222,24 @@ def _compute_temp_stats(well_type, start_dt, end_dt, pdf_temp):
 
     diff = abs(pdf_temp - avg_temp)
     match = diff <= 5.0
-    return {"status": "ok" if match else "bad", "avg_temp": avg_temp, "pdf_temp": pdf_temp, "diff": diff}
+    result = {"status": "ok" if match else "bad", "avg_temp": avg_temp, "pdf_temp": pdf_temp, "diff": diff}
+    # На титуле подрядчик ставит 0 при любой температуре без надбавки
+    # (летние акты: в акте 0, по отчёту +12...+21) — раньше это давало
+    # ложное расхождение на каждом летнем акте. Расхождением считаем
+    # только случай, когда температуры дают РАЗНЫЙ температурный
+    # коэффициент, т.е. влияют на оплату.
+    try:
+        from integral import CoefficientTable
+
+        table = CoefficientTable()
+        result["k_act"] = table.get_temperature_coefficient(pdf_temp)
+        result["k_report"] = table.get_temperature_coefficient(avg_temp)
+        if not match and abs(result["k_act"] - result["k_report"]) < 0.001:
+            result["status"] = "ok"
+            result["same_coefficient"] = True
+    except Exception:
+        pass
+    return result
 
 
 def analyze_period(well_name, well_type, start_dt, end_dt, pdf_temp):
@@ -240,7 +257,9 @@ def analyze_period(well_name, well_type, start_dt, end_dt, pdf_temp):
     print(f"Температура в акте: {result['pdf_temp']:.2f}°C")
     print(f"Разница: {result['diff']:.2f}°C")
     print(f"📋 РЕЗУЛЬТАТ: ", end="")
-    if result["status"] == "ok":
+    if result["status"] == "ok" and result.get("same_coefficient"):
+        print(f"✅ СООТВЕТСТВУЕТ (температурный коэффициент тот же: {result['k_act']:.2f})")
+    elif result["status"] == "ok":
         print("✅ СООТВЕТСТВУЕТ (±5°C)")
     else:
         print("❌ НЕ СООТВЕТСТВУЕТ")

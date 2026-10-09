@@ -232,10 +232,28 @@ class API:
 
     def _clear_reference_caches(self) -> None:
         """Сбрасывает in-memory кэши справочников, чтобы обновлённый файл
-        подхватился сразу, без перезапуска приложения."""
+        подхватился сразу, без перезапуска приложения.
+
+        Раньше сбрасывался только _vm_price_df_cache и кэши table_parser —
+        категория "mileage" ("17. Отчет по километражу.xlsx") тоже
+        обновляема через это меню, но её лист "Лист1" отдельно кэшируется
+        в FinalUnifiedParser (_rate_reference_cache, _prayskurant_codes_
+        cache, _prayskurant_prices_cache, _prayskurant_41_cache) — эти
+        кэши не сбрасывались, и "Проверка расценок"/"Интегральный
+        коэффициент" молча продолжали работать по старым данным до
+        перезапуска приложения, хотя сообщение об успехе обещало
+        обратное. Сбрасываем все известные кэши справочников, а не
+        только те, что были нужны для первой (VM/температура) фичи."""
         try:
-            from src.extractors.main_parser import WellData
+            from src.extractors.main_parser import WellData, FinalUnifiedParser
+            import src.extractors.main_parser as main_parser_module
             WellData._vm_price_df_cache = None
+            FinalUnifiedParser._rate_reference_cache = None
+            FinalUnifiedParser._party_keywords_cache = None
+            FinalUnifiedParser._prayskurant_codes_cache = None
+            FinalUnifiedParser._prayskurant_prices_cache = None
+            FinalUnifiedParser._prayskurant_41_cache = None
+            main_parser_module._contract_coefficients_cache = None
         except Exception:
             pass
         try:

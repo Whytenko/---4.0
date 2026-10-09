@@ -64,7 +64,11 @@ def test_barometry_task53_missing():
     well = _make_well_data()
     well.task_number = "53"
     rows = [{"name": "Запись муфтовых соед.локатором муфт (ЛМ)"}]
-    assert well._check_barometry_task53(rows)["status"] == "bad"
+    # Отсутствие барометрии — предупреждение, а не расхождение (решение
+    # заказчика от 09.10.2026): на итог по акту не влияет.
+    result = well._check_barometry_task53(rows)
+    assert result["status"] == "conditional_ok"
+    assert any("⚠" in line for line in result["details"])
 
 
 def test_barometry_check_neutral_for_other_tasks():
@@ -166,3 +170,84 @@ def test_km_relocation_note_detected():
     pdf_without_note = _FakePdf(["стр1", "... Приезд на базу ..."])
     assert km_parser._has_relocation_note(pdf_with_note) is True
     assert km_parser._has_relocation_note(pdf_without_note) is False
+
+
+# ---- Номер задачи с латинским суффиксом, температура титул/акт-заказ,
+# ---- дата акта подрядчика (реальный акт 16003) ----
+
+def test_task_number_keeps_latin_suffix():
+    from src.extractors.main_parser import FinalUnifiedParser
+    parser = FinalUnifiedParser()
+    text = "Задача №35(S) Определение тех.состояния э/колонн\nЗадача №87(Н) Прочее"
+    assert parser._parse_task_number(text) == "35(S)"
+    assert parser._parse_performed_tasks(text) == "35(S)+87(Н)"
+    assert parser._parse_task_number("Задача №58.141 Перфорация") == "58.141"
+
+
+def test_temperature_zakaz_same_coefficient_is_ok():
+    # Акт 16003: титул 0, акт-заказ -1 — коэффициент один (1.00).
+    well = _make_well_data()
+    well.temperature = "0"
+    well.page2_temperature = "-1"
+    result = well._check_temperature_zakaz()
+    assert result["status"] == "ok", result
+    # Летние акты: титул 0, акт-заказ +22 — тоже не расхождение.
+    well.page2_temperature = "22"
+    assert well._check_temperature_zakaz()["status"] == "ok"
+
+
+def test_temperature_zakaz_other_coefficient_is_bad():
+    well = _make_well_data()
+    well.temperature = "0"
+    well.page2_temperature = "-12"
+    assert well._check_temperature_zakaz()["status"] == "bad"
+    well.temperature = "-11,17"
+    assert well._check_temperature_zakaz()["status"] == "ok"
+
+
+def test_temperature_zakaz_neutral_without_value():
+    well = _make_well_data()
+    well.temperature = "0"
+    assert well._check_temperature_zakaz()["status"] == "neutral"
+
+
+def test_contractor_act_date_outside_work_period():
+    # Акт 16003: работы 04-05.10.2026, в акте о тех.дежурстве — 04 сентября.
+    well = _make_well_data()
+    well.start_date = "04.10.2026 18:30"
+    well.end_date = "05.10.2026 12:00"
+    well.contractor_act_dates = ["04.09.2026"]
+    assert well._check_contractor_act_dates()["status"] == "bad"
+    well.contractor_act_dates = ["04.10.2026"]
+    assert well._check_contractor_act_dates()["status"] == "ok"
+    well.contractor_act_dates = []
+    assert well._check_contractor_act_dates()["status"] == "neutral"
+
+
+def test_contractor_act_dates_parsed_from_text_pages_only():
+    from src.extractors.main_parser import FinalUnifiedParser
+    pdf = _FakePdf([
+        "титул",
+        "Мы, нижеподписавшиеся: ... составили настоящий акт о том, что нами проверена готовность скважины",
+        "Мы, нижеподписавшиеся: ... составили настоящий акт о том, что «04» сентября 2026 года\n"
+        "Технологическое дежурство партии составило -4 часа.",
+        "",
+    ])
+    assert FinalUnifiedParser()._parse_contractor_act_dates(pdf) == ["04.09.2026"]
+
+
+def test_tech_duty_hours_not_confused_with_task_number():
+    # Акт 16003: "ГИС 35(S) составило -4 часа" давало "Тех.деж. 35ч."
+    from src.extractors.main_parser import FinalUnifiedParser
+    parser = FinalUnifiedParser()
+    pre = "Мы, нижеподписавшиеся составили настоящий акт о том, что «04» октября 2026 года на скважине №1 "
+    text = pre + "Технологическое дежурство партии при проведении ГИС 35(S) составило -4 часа."
+    assert parser._extract_contractor_comment(text) == "Тех.деж. 4ч."
+    text = pre + "Тех. дежурство партии при проведении ГИС 58.134 составило 2-х часов"
+    assert parser._extract_contractor_comment(text) == "Тех.деж. 2ч."
+
+    # Тот же факт из строк расценок и из акта подрядчика — один раз.
+    well = _make_well_data()
+    well.contractor_comment = "Тех.деж. 4ч."
+    well._finalize_contractor_comment([{"name": "Тех.дежурство компл. партии в действ.фонде", "volume": 4.0}])
+    assert well.contractor_comment == "Тех.деж. 4ч."

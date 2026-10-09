@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.utils.app_paths import ensure_runtime_layout, get_input_dir, get_reference_dir
+from src.extractors.act_pages import act_text
 
 def _parse_float(value):
     if value is None:
@@ -201,7 +202,8 @@ def compute_km_report(pdf_path: Path) -> dict:
     """Считает сверку километража без печати (используется и консольным
     отчётом, и пакетным Excel-отчётом)."""
     with pdfplumber.open(pdf_path) as pdf:
-        text = pdf.pages[0].extract_text() if pdf.pages else ""
+        # Строки переездов могут уйти на лист-продолжение титула.
+        text = act_text(pdf, 0)
         relocation_note = _has_relocation_note(pdf)
     field = parse_field(text)
     bush = parse_bush(text)
