@@ -176,6 +176,15 @@ class WellData:
     # для сверки с той же расценкой в таблице расценок акт-наряда (стр.1).
     # Обе величины в одних единицах (100 м).
     page2_spo: str = ""
+    # Номер расценки спуска/подъёма, по которой взят page2_spo (346 — в
+    # открытом стволе, 348 — через лубрикатор), и прочитан ли он OCR со
+    # скана (тогда запятая часто теряется: "6836" вместо "68,36").
+    page2_spo_rate: str = ""
+    page2_spo_from_ocr: bool = False
+    # Все варианты прочтения этой строки со скана (разные обрезки/
+    # разрешения дают разные OCR-ошибки: в акте 12271 "200,32" читалось
+    # и как "20052", и верно) — совпадение засчитывается по любому.
+    page2_spo_candidates: List[str] = field(default_factory=list)
     # "Температура воздуха, гр" со страницы "АКТ-ЗАКАЗ" — сверяется с
     # температурой титульного листа (см. _check_temperature_zakaz). Только
     # с текстового слоя: на сканах значение вписано от руки и OCR его не
@@ -390,6 +399,17 @@ class WellData:
                     match = True
                     details[0] = f"    СПО в акте = {candidate_m:.2f} (сумма строк С/п прибора и шаблона)"
                     break
+        if not match and not self._spo_reference_required():
+            # Инструкция: "Спуск скв. прибора проверяем по справке (для ГИС
+            # №53, 11, 34, 35, 6, 7, 80, 87)". У остальных задач справка
+            # часто относится к другой работе (акт 12490, задача 54.1:
+            # справка — по шаблонированию задачи 53, а СПО магнита
+            # подтверждено актом о работах) — показываем, но не как ❌.
+            details.append(
+                f"    ⚠ не совпадает со справкой ({spo_act:.2f} / {spo_table:.2f} м) — "
+                "для этой задачи сверка СПО по справке не обязательна"
+            )
+            return {"status": "conditional_ok", "value_text": "⚠️ не совпадает со справкой", "details": details}
         if not match and spo_table < 20 and raw_act * 100 >= 500:
             # Из справки прочитано однозначное число (4,00 при спуске на
             # 18 972 м — акты 12490, 13030): это не глубина, а соседняя
@@ -400,6 +420,16 @@ class WellData:
                 "details": details,
             }
         return {"status": "ok" if match else "bad", "details": details}
+
+    # Задачи, у которых СПО проверяется по справке (инструкция заказчика).
+    SPO_REFERENCE_TASKS: ClassVar[frozenset] = frozenset({"53", "11", "34", "35", "6", "7", "80", "87"})
+
+    def _spo_reference_required(self) -> bool:
+        tasks = [t for t in (self.performed_tasks or self.task_number or "").split("+") if t]
+        if not tasks:
+            return True
+        return any(re.match(r"\d+", task).group() in self.SPO_REFERENCE_TASKS
+                   for task in tasks if re.match(r"\d+", task))
 
     def _check_vm_cost(self) -> dict:
         task = self.vm_task
@@ -833,53 +863,80 @@ class WellData:
             return {"status": "bad", "details": flagged}
         return {"status": "ok", "details": [f"В норме (≤{threshold:.0f} м), строк перфорации: {checked}"]}
 
-    def _check_spo_zakaz(self, rows: List[dict]) -> dict:
-        """СПО (расценка 348 "Спуск или подъем скв. прибора через лубр.")
-        должно совпадать между таблицей расценок акт-наряда (стр.1) и
-        таблицей "Прочие виды работ" акт-заказа (стр.2) — обе величины
-        в одних единицах (100 м), без эвристики ×100/÷100, которая
-        нужна старой проверке "spo" (сверка с текстовой строкой на
-        странице "Справка по зарегистрированному материалу").
+    # Расценки спуска/подъёма скважинного прибора: 346 — в открытом стволе
+    # или колонне, 348 — через лубрикатор.
+    TOOL_TRIP_RATES: ClassVar[tuple] = ("348", "346")
 
-        Если расценки 348 нет вовсе на одной из двух страниц, а на
-        другой есть ненулевое значение — это и есть основной случай,
-        который старая проверка пропускала молча (self.volume оставался
-        пустым, и _check_volume_spo просто не срабатывал): СПО-работа
-        зафиксирована как выполненная на одной странице, но не выставлена
-        к оплате (или наоборот) на другой."""
-        naryad_value = None
+    @classmethod
+    def _tool_trip_volumes(cls, rows: List[dict]) -> dict:
+        """{расценка: объём} строк "С/п скв.приб..." акт-наряда (стр.1)."""
+        volumes: dict = {}
         for row in rows:
-            if row.get("rate_number") == "348":
-                naryad_value = row.get("volume")
-                break
+            name = re.sub(r"\s+", "", str(row.get("name", "")).lower()).replace("c/п", "с/п")
+            rate = str(row.get("rate_number", ""))
+            if not (name.startswith("с/пскв.приб") or rate in cls.TOOL_TRIP_RATES):
+                continue
+            volume = row.get("volume")
+            if isinstance(volume, (int, float)):
+                volumes[rate] = volumes.get(rate, 0.0) + float(volume)
+        return volumes
 
+    @staticmethod
+    def _same_digits(value: float, ocr_text: str) -> bool:
+        """OCR скана теряет запятую ("6836" при 68,36, "85" при 8,50) —
+        сравниваем цифры без разделителей и без незначащих нулей в конце."""
+        expected = f"{value:.2f}".replace(".", "").lstrip("0").rstrip("0")
+        got = re.sub(r"\D", "", ocr_text).lstrip("0").rstrip("0")
+        return bool(got) and expected == got
+
+    def _check_spo_zakaz(self, rows: List[dict]) -> dict:
+        """СПО: строка "С/п скв.приб..." акт-наряда (стр.1, расценка 346 или
+        348) должна совпадать с той же расценкой в таблице "Прочие виды
+        работ / Спуски, подъемы" акт-заказа (стр.2) — обе величины в сотнях
+        метров (реальный акт 12490: 189,72 и 189,72).
+
+        Если расценки нет вовсе на одной из двух страниц, а на другой есть
+        ненулевое значение — СПО зафиксировано как выполненное на одной
+        странице, но не выставлено к оплате (или наоборот) на другой."""
+        title = self._tool_trip_volumes(rows)
         zakaz_raw = str(self.page2_spo or "").strip()
         if not zakaz_raw:
-            # Таблицу "Прочие виды работ" на акт-заказе не нашли/не
-            # распознали для этого акта — недостаточно данных, а не
-            # подтверждённое расхождение.
+            if title and not self._has_task_lump_sum_rate(rows):
+                # Строку в акт-заказе не нашли/не распознали — это
+                # недостаток данных, а не подтверждённое расхождение.
+                return {"status": "neutral", "value_text": "акт-заказ не распознан"}
             return {"status": "neutral"}
 
-        zakaz_value = self._to_float(zakaz_raw) or 0.0
+        rate = self.page2_spo_rate or "348"
+        naryad_value = title.get(rate)
         if naryad_value is None and self._has_task_lump_sum_rate(rows):
             # Задача оплачивается одной договорной расценкой Прейскуранта
             # (напр. 80(P) — расц. 1364): спуск-подъём в неё уже включён и
-            # отдельной строкой 348 в акт-наряд не выставляется (акты
-            # 12272, 12366, 12379) — сверять не с чем.
+            # отдельной строкой в акт-наряд не выставляется (акты 12272,
+            # 12366, 12379) — сверять не с чем.
             return {"status": "neutral"}
         naryad_value = naryad_value if naryad_value is not None else 0.0
-
+        zakaz_value = self._to_float(zakaz_raw) or 0.0
         if naryad_value == 0.0 and zakaz_value == 0.0:
             return {"status": "neutral"}
 
+        details = [f"    СПО в акт-наряде (расц. {rate}, стр.1) = {naryad_value:.2f}"]
+        if self.page2_spo_from_ocr:
+            candidates = self.page2_spo_candidates or [zakaz_raw]
+            matched = next((c for c in candidates if self._same_digits(naryad_value, c)), None)
+            if matched is not None:
+                details.append(f"    СПО в акт-заказе (расц. {rate}, стр.2, скан) = {naryad_value:.2f}")
+                return {"status": "ok", "details": details}
+            # Со скана прочитано другое число — но OCR путает цифры (3 и 5,
+            # 3 и 8), поэтому это не подтверждённое расхождение.
+            details.append(
+                f"    ⚠ СПО в акт-заказе (расц. {rate}, стр.2) со скана прочитано как "
+                f"{' / '.join(candidates[:3])} — сверьте вручную"
+            )
+            return {"status": "conditional_ok", "value_text": "⚠️ сверьте со сканом", "details": details}
         match = abs(naryad_value - zakaz_value) < 0.015
-        return {
-            "status": "ok" if match else "bad",
-            "details": [
-                f"    СПО в акт-наряде (расц. 348, стр.1) = {naryad_value:.2f}",
-                f"    СПО в акт-заказе (стр.2) = {zakaz_value:.2f}",
-            ],
-        }
+        details.append(f"    СПО в акт-заказе (расц. {rate}, стр.2) = {zakaz_value:.2f}")
+        return {"status": "ok" if match else "bad", "details": details}
 
     # Договорные расценки Прейскуранта, которыми задача оплачивается
     # целиком ("Задачи №80(P), №80(S), №53, №42, №58, №86, №86(Н), 86(L),
@@ -1274,7 +1331,6 @@ class FinalUnifiedParser:
                         scan_text = ""
                     well_data.page2_dates_from_ocr = "Начало работ" not in scan_text
                     well_data.page2_contract_number = self._parse_contract_number_page2(pdf.pages[scan_idx])
-                    well_data.page2_spo = self._parse_spo_zakaz(pdf.pages[scan_idx])
                     well_data.page2_temperature = self._parse_temperature_zakaz(pdf.pages[scan_idx])
                     well_data.page2_requisites = self._parse_requisites_zakaz(pdf.pages[scan_idx])
 
@@ -1317,6 +1373,15 @@ class FinalUnifiedParser:
                 well_data.check_results["hours_vs_duration"] = well_data._check_billed_hours_vs_duration(rate_rows)
                 well_data.check_results["thermometry_overlap"] = well_data._check_thermometry_overlap(rate_rows)
                 well_data.check_results["interval_length"] = well_data._check_interval_length(rate_rows)
+                tool_trips = WellData._tool_trip_volumes(all_rate_rows)
+                if tool_trips:
+                    zakaz_pages = [scan_idx] if scan_idx is not None else list(scan_candidates[:3])
+                    (
+                        well_data.page2_spo,
+                        well_data.page2_spo_rate,
+                        well_data.page2_spo_from_ocr,
+                        well_data.page2_spo_candidates,
+                    ) = self._find_spo_zakaz(pdf, zakaz_pages, tool_trips)
                 well_data.check_results["spo_zakaz"] = well_data._check_spo_zakaz(rate_rows)
                 well_data.tech_duty_hours_title = well_data._tech_duty_hours_from_rows(all_rate_rows)
                 well_data._finalize_contractor_comment(rate_rows)
@@ -2997,10 +3062,15 @@ class FinalUnifiedParser:
         # (стр.2) содержит поле-decoy "Условия проведения СПО 4" — если
         # общий паттерн проверить раньше специфичного, он вслепую цепляет
         # эту постороннюю цифру "4" вместо настоящего метража со «Справки».
+        # Только итоговая строка справки: "СПО: 7279.99 м" — с двоеточием и
+        # единицей "м". Раньше годилось любое "СПО <число>", и на скане
+        # акта о работах ("СПО1 магнитного ловителя 0-1820") или акт-заказа
+        # ("Условия проведения СПО 4") бралась посторонняя цифра — акт 12490
+        # показывал "СПО в таблице = 4,00" вместо 7279,99 м.
         patterns = [
             r'Спуск[\s\-]*подъ[её]м\s*прибора\s*составил\s*[-–:]?\s*([\d\s]+[,\.\d]*)\s*м',
-            r'С\s*П\s*О\s*[:\-]?\s*([\d\s]+[,\.\d]*)\s*м?',
-            r'СПО\s*[:\-]?\s*([\d\s]+[,\.\d]*)\s*м?',
+            # Целое тоже бывает: "СПО: 100 м" (акт 12676).
+            r'С\s*П\s*О\s*[:;]\s*(\d[\d ]*(?:[.,]\d{1,2})?)\s*[мm]',
         ]
         for pattern in patterns:
             for match in re.finditer(pattern, normalized, re.IGNORECASE):
@@ -3010,25 +3080,6 @@ class FinalUnifiedParser:
                 if re.search(r'\d', value):
                     return value
 
-        # If OCR split the number to the next line, look around "СПО" line.
-        lines = normalized.splitlines()
-        for i, line in enumerate(lines):
-            if "СПО" in line or "С П О" in line:
-                # Try number on the same line
-                match = re.search(r'([\d\s]+[,\.\d]*)', line)
-                if match:
-                    value = match.group(1).replace(' ', '').replace(',', '.')
-                    value = re.sub(r'[^0-9\.\-]', '', value)
-                    if re.search(r'\d', value):
-                        return value
-                # Try next line
-                if i + 1 < len(lines):
-                    match = re.search(r'([\d\s]+[,\.\d]*)', lines[i + 1])
-                    if match:
-                        value = match.group(1).replace(' ', '').replace(',', '.')
-                        value = re.sub(r'[^0-9\.\-]', '', value)
-                        if re.search(r'\d', value):
-                            return value
         return ""
 
     def _parse_spo_fallback_number(self, text: str) -> str:
@@ -3097,6 +3148,26 @@ class FinalUnifiedParser:
 
         pages = list(pdf.pages)
         page_count = len(pages)
+
+        # Справка по зарегистрированному материалу — один из последних
+        # листов-сканов, а строка "СПО: ... м" стоит сразу под таблицей
+        # замеров, высота которой зависит от их числа (в акте 12490 — в
+        # верхней четверти листа, где обрезки ниже её не видели). Поэтому
+        # сначала читаем сканы целиком.
+        try:
+            from PIL import ImageOps
+            for page in pages[max(1, page_count - 5):]:
+                if (page.extract_text() or "").strip():
+                    continue
+                image = page.to_image(resolution=200).original
+                gray = ImageOps.autocontrast(ImageOps.grayscale(image))
+                text = pytesseract.image_to_string(gray, lang="rus+eng", config="--psm 6", timeout=20)
+                value = self._parse_spo_from_text(text)
+                if value:
+                    return value
+        except Exception:
+            pass
+
         # Narrow scan to likely pages to avoid long OCR runs.
         if page_count >= 9:
             scan_order = [8, 6, 5, 7]  # include 9th page first (0-based)
@@ -3741,15 +3812,12 @@ class FinalUnifiedParser:
                     dates.append(value)
         return dates
 
-    def _parse_spo_zakaz(self, page) -> str:
-        """"Всего выполнено" по расценке 348 ("Спуск или подъем скв.
-        прибора через лубр.") из таблицы "Прочие виды работ" на
-        акт-заказе (стр.2). Таблица находится по заголовку (колонки
-        "Номер расценки" и "Всего выполнено"), а не по фиксированному
-        индексу — на реальных актах на этой странице обычно 9 таблиц
-        (шапка формы, служебные блоки дат, эта таблица расценок,
-        таблица переездов, персонал и т.д.), и их порядок/количество
-        может отличаться."""
+    def _parse_spo_zakaz(self, page, rates=WellData.TOOL_TRIP_RATES) -> tuple:
+        """"Всего выполнено" по расценке спуска/подъёма (346/348) из таблицы
+        "Прочие виды работ" на акт-заказе с текстовым слоем. Таблица
+        находится по заголовку (колонки "Номер расценки" и "Всего
+        выполнено"), а не по фиксированному индексу — на реальных актах на
+        этой странице обычно 9 таблиц. Возвращает (значение, расценка)."""
         try:
             tables = page.extract_tables() or []
         except Exception:
@@ -3778,13 +3846,94 @@ class FinalUnifiedParser:
                 if not row or number_col >= len(row):
                     continue
                 rate_number = self._normalize_rate_number(row[number_col])
-                if rate_number != "348":
+                if rate_number not in rates:
                     continue
                 if total_col >= len(row):
-                    return "0.00"
+                    return "0.00", rate_number
                 value = self._parse_decimal(row[total_col])
-                return f"{value:.2f}" if value is not None else "0.00"
-        return ""
+                return (f"{value:.2f}" if value is not None else "0.00"), rate_number
+        return "", ""
+
+    _SPO_ZAKAZ_OCR_RE: ClassVar = re.compile(
+        # "346 | Спуск или подъем скв. прибора в открытом стволе | 100м | 189,72"
+        # "348 [Спуск или подьем exe. прибора через лубр. | 100 | 6836 |"
+        # "Г 346 [Guyer wn подьем ска. npuGopa в открытом столен{ 100m [18972 У"
+        r'\b(?P<rate>34[68])\b(?P<name>.*?)\b100\s*[мm]?\s*[|\]\[{}!lI ]*\s*(?P<value>\d[\d.,]*)'
+    )
+
+    def _parse_spo_zakaz_ocr(self, page, rates=WellData.TOOL_TRIP_RATES, expected=None) -> tuple:
+        """То же со скана акт-заказа: OCR левой части листа, где таблица
+        "Прочие виды работ / Спуски, подъемы". Значение на сканах печатное,
+        но OCR то теряет запятую ("6836" при 68,36), то путает цифры —
+        поэтому строка читается в нескольких обрезках и разрешениях, и
+        возвращаются все варианты: (варианты, расценка). Если передан
+        expected (объём со стр.1), чтение останавливается на первом
+        совпавшем варианте."""
+        try:
+            import pytesseract
+            from PIL import ImageOps
+        except Exception:
+            return [], ""
+        if not self._configure_tesseract(pytesseract):
+            return [], ""
+        h, w = page.height, page.width
+        candidates: List[str] = []
+        found_rate = ""
+        attempts = (
+            ((0, 0.25, 0.62, 0.62), 300),
+            ((0, 0.20, 0.65, 0.70), 300),
+            ((0, 0.30, 0.60, 0.60), 300),
+            ((0, 0.25, 0.62, 0.62), 400),
+        )
+        for box, dpi in attempts:
+            try:
+                crop = page.crop((w * box[0], h * box[1], w * box[2], h * box[3]))
+                image = ImageOps.autocontrast(ImageOps.grayscale(crop.to_image(resolution=dpi).original))
+                text = pytesseract.image_to_string(image, lang="rus+eng", config="--psm 6", timeout=20)
+            except Exception:
+                continue
+            for line in text.splitlines():
+                match = self._SPO_ZAKAZ_OCR_RE.search(line)
+                if not match or match.group("rate") not in rates:
+                    continue
+                name = match.group("name").lower()
+                # Только строка спуска прибора, а не случайное "346" рядом.
+                if not any(key in name for key in ("пуск", "подъ", "подь", "прибор", "npu", "ствол", "лубр")):
+                    continue
+                value = match.group("value").rstrip(".,")
+                if found_rate and match.group("rate") != found_rate:
+                    continue
+                found_rate = match.group("rate")
+                if value.strip("0.,") and value not in candidates:
+                    candidates.append(value)
+                if expected is not None and WellData._same_digits(expected, value):
+                    return candidates, found_rate
+                break
+        return candidates, found_rate
+
+    def _find_spo_zakaz(self, pdf, page_indices, volumes: dict) -> tuple:
+        """(значение, расценка, со скана?, все варианты со скана) — сначала
+        текстовый слой, затем OCR, по кандидатам в страницу акт-заказа.
+        volumes — {расценка: объём} строк спуска/подъёма со стр.1."""
+        rates = tuple(volumes) or WellData.TOOL_TRIP_RATES
+        for idx in page_indices:
+            if idx is None or idx >= len(pdf.pages):
+                continue
+            page = pdf.pages[idx]
+            try:
+                has_text = bool((page.extract_text() or "").strip())
+            except Exception:
+                has_text = False
+            if has_text:
+                value, rate = self._parse_spo_zakaz(page, rates)
+                if value:
+                    return value, rate, False, []
+                continue
+            expected = next(iter(volumes.values()), None) if len(volumes) == 1 else None
+            candidates, rate = self._parse_spo_zakaz_ocr(page, rates, expected)
+            if candidates:
+                return candidates[-1] if expected is not None else candidates[0], rate, True, candidates
+        return "", "", False, []
 
     def _parse_page2_start_end(self, pdf, candidate_indices=None):
         """Ищет страницу со сканом «АКТ-ЗАКАЗ» (Начало работы на объекте /
