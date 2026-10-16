@@ -185,6 +185,14 @@ class WellData:
     # разрешения дают разные OCR-ошибки: в акте 12271 "200,32" читалось
     # и как "20052", и верно) — совпадение засчитывается по любому.
     page2_spo_candidates: List[str] = field(default_factory=list)
+    # Тексты актов подрядчика ("Мы, нижеподписавшиеся ... составили
+    # настоящий акт о том, что ..."), кроме рутинного акта готовности
+    # скважины: [(номер страницы, текст)] — источник причины смены задачи
+    # и типа перфоратора, когда его нет на титуле.
+    contractor_acts: List[tuple] = field(default_factory=list)
+    # ПВР: перфоратор, тип и количество зарядов ("Скорпион89К, заряд
+    # Скорпион ПП-25СГП — 150 шт.") — для колонки "Комментарии".
+    pvr_summary: str = ""
     # "Температура воздуха, гр" со страницы "АКТ-ЗАКАЗ" — сверяется с
     # температурой титульного листа (см. _check_temperature_zakaz). Только
     # с текстового слоя: на сканах значение вписано от руки и OCR его не
@@ -600,6 +608,88 @@ class WellData:
         if details:
             return {"status": "bad", "details": details}
         return {"status": "ok"}
+
+    @property
+    def ordered_task(self) -> str:
+        """Задача по заявке: из заявки, пришедшей отдельным файлом пакета,
+        иначе — распознанная со встроенной в акт страницы заявки."""
+        return self.matched_zayavka_task or self.embedded_zayavka_task or ""
+
+    def task_change_note(self) -> str:
+        """Пусто, если по заявке выполнена та же задача. Иначе — "заявка N
+        → выполнена M" и причина из акта подрядчика (обычно на последних
+        листах: недоход, стоянка прибора, скважина не готова и т.п.)."""
+        ordered = self.ordered_task
+        performed = [t for t in (self.performed_tasks or self.task_number or "").split("+") if t]
+        if not performed:
+            return ""
+        if not ordered:
+            # Задача 500.4 сама по себе означает недоход — переход с
+            # заказанной задачи, даже если заявку распознать не удалось.
+            if any(task.startswith("500.4") for task in performed):
+                reason = self._task_change_reason()
+                note = "Выполнена 500.4 (недоход), задача по заявке не распознана"
+                return f"{note}. Причина: {reason}" if reason else note
+            return ""
+        from src.extractors.doc_linking import _same_task
+
+        def _is_refinement(task: str) -> bool:
+            # 58 по заявке и 58.134 в акте, 35 и 35(S) — уточнение той же
+            # задачи, не смена. А 80(S) по заявке и 80(P) в акте — смена.
+            if _same_task(task, ordered):
+                return True
+            ordered_core = re.match(r"\d+(?:\.\d+)?", ordered)
+            return bool(ordered_core) and "(" not in ordered and "." not in ordered and (
+                re.match(r"\d+", task) and re.match(r"\d+", task).group() == ordered_core.group()
+            )
+
+        if any(_is_refinement(task) for task in performed):
+            return ""
+        note = f"Заявка: задача {ordered} → выполнена {'+'.join(performed)}"
+        reason = self._task_change_reason()
+        return f"{note}. Причина: {reason}" if reason else f"{note}. Причина в актах не найдена — уточнить у подрядчика"
+
+    _ROUTINE_ACT_RE: ClassVar = re.compile(
+        r"проверена\s+готовност|опрессовк|перфоратор\s*\(тип\)", re.IGNORECASE
+    )
+    _CHANGE_REASON_HINTS: ClassVar[tuple] = (
+        "недоход", "не дош", "непроход", "не прош", "стоянк", "посадк", "не готов",
+        "отказ", "остановк", "прихват", "задач",
+    )
+
+    def _task_change_reason(self) -> str:
+        """Суть акта подрядчика, объясняющего смену задачи: акт с
+        "недоход"/"стоянка"/"задачи №..." в тексте, иначе первый не
+        рутинный акт. Шапка (дата, скважина, куст, месторождение)
+        отрезается, длина ограничена — подробности в самом акте."""
+        acts = [(idx, text) for idx, text in self.contractor_acts if not self._ROUTINE_ACT_RE.search(text)]
+        if not acts:
+            return ""
+        chosen = next(
+            ((idx, text) for idx, text in acts if any(h in text.lower() for h in self._CHANGE_REASON_HINTS)),
+            acts[0],
+        )
+        idx, text = chosen
+        body = " ".join(text.replace("_", " ").split())
+        # Шапка "о том, что «14» августа 2026 года на скважине № 1052г куст
+        # № 29 им В.И. Некрасова месторождения, ..." — суть начинается после
+        # месторождения ("м/р <название>" или "<название> месторождения").
+        head = None
+        for pattern in (
+            # "м/р (площадь) Повховского", "м/р, (площадь) Ватьеганское" —
+            # одно слово названия: следующее с заглавной ("При выполнении")
+            # уже суть акта.
+            r"м\s*/\s*р\.?[,\s]*(?:\([^)]*\))?[,\s]*[А-ЯЁ][\w\-.]*[,.:]?\s*",
+            r"месторождени\w*[,.:]?\s*",
+        ):
+            match = re.search(pattern, body[:260])
+            if match and (head is None or match.end() > head):
+                head = match.end()
+        if head and head < len(body) - 20:
+            body = body[head:]
+        if len(body) > 220:
+            body = body[:217].rsplit(" ", 1)[0] + "..."
+        return f"{body} (акт, стр. {idx + 1})"
 
     def _check_requisites_zakaz(self) -> dict:
         """Заказ, скважина, куст, забой, угол наклона и задача: титульный
@@ -1090,6 +1180,11 @@ class WellData:
             comment = " ".join(comment.replace(duty, " ").split())
         if comment:
             parts.append(comment)
+        # Для ПВР — перфоратор и заряды, если их не дала спецификация со
+        # страницы ИТП/ПВР (у 581/582/583 её обычно нет — в комментарии
+        # оставалось одно "Тех.деж.").
+        if self.pvr_summary and not self.perforation_spec:
+            parts.append(self.pvr_summary)
         self.contractor_comment = " ".join(parts) if parts else "+"
 
     def _check_thermometry_overlap(self, rows: List[dict]) -> dict:
@@ -1313,6 +1408,7 @@ class FinalUnifiedParser:
                 ocr_task, well_data.contractor_comment, well_data.perforation_spec = (
                     self._parse_zayavka_and_comment(pdf)
                 )
+                well_data.contractor_acts = list(getattr(self, "_last_contractor_acts", []))
                 well_data.contractor_act_dates = self._parse_contractor_act_dates(pdf)
                 if self._task_number_plausible(ocr_task, well_data.performed_tasks):
                     # Суффикс "(S)"/"(P)" со скана заявки OCR обычно теряет —
@@ -1384,6 +1480,9 @@ class FinalUnifiedParser:
                     ) = self._find_spo_zakaz(pdf, zakaz_pages, tool_trips)
                 well_data.check_results["spo_zakaz"] = well_data._check_spo_zakaz(rate_rows)
                 well_data.tech_duty_hours_title = well_data._tech_duty_hours_from_rows(all_rate_rows)
+                well_data.pvr_summary = self._pvr_summary(
+                    text, all_rate_rows, well_data.performed_tasks, well_data.contractor_acts
+                )
                 well_data._finalize_contractor_comment(rate_rows)
 
                 if well_data.start_date == "не найдено" or well_data.end_date == "не найдено":
@@ -2273,6 +2372,70 @@ class FinalUnifiedParser:
                 tool_and_template += float(volume)
         return [round(value, 2) for value in dict.fromkeys((tool_and_template, total)) if value > 0]
 
+    _VM_LINE_RE: ClassVar = re.compile(
+        # "58.227- Скорпион89К - Скорпион ПП-25СГП 150 х 2 292,67 343 900,50"
+        r'^(?P<task>\d+(?:\.\d+)*)\s*-\s*(?P<body>.+?)\s+(?P<count>\d+)\s*[хx]\s*\d[\d ]*,\d{2}\s+\d[\d ]*,\d{2}\s*$'
+    )
+    PVR_TASK_BASES: ClassVar[frozenset] = frozenset({"58", "581", "582", "583", "59"})
+
+    def _parse_vm_lines(self, text: str) -> List[dict]:
+        """Строки блока "Стоимость ВМ" титульного листа: задача, перфоратор,
+        тип заряда, количество. Комплектующие наборы (581.416.1) — не
+        заряды, пропускаются."""
+        block = re.search(r'Стоимость ВМ[^\n]*\n(.*?)(?:Стоимость расходных|Всего к оплате)', text, re.DOTALL)
+        if not block:
+            return []
+        lines = []
+        for line in block.group(1).splitlines():
+            match = self._VM_LINE_RE.match(line.strip())
+            if not match:
+                continue
+            body = match.group("body")
+            if re.search(r'набор|комплект', body, re.IGNORECASE):
+                continue
+            parts = [part.strip() for part in re.split(r'\s+-\s+', body) if part.strip()]
+            perforator, charge = (parts[0], " - ".join(parts[1:])) if len(parts) > 1 else ("", parts[0] if parts else "")
+            lines.append({"task": match.group("task"), "perforator": perforator,
+                          "charge": charge, "count": int(match.group("count"))})
+        return lines
+
+    def _pvr_summary(self, text: str, rows: List[dict], tasks: str, contractor_acts: List[tuple]) -> str:
+        """Перфоратор, тип и количество зарядов для акта ПВР (задачи 58,
+        581, 582, 583, 59 и аналогичные). Источники по надёжности: строки
+        "Стоимость ВМ" титула; если ВМ не выставлено (582/583 — перфорация
+        на НКТ) — тип перфоратора из акта подрядчика ("перфоратор (тип)
+        ...") и количество из строк расценок с единицей "заряд"."""
+        vm_lines = self._parse_vm_lines(text)
+        bases = {re.match(r'\d+', t).group() for t in tasks.split("+") if re.match(r'\d+', t)}
+        if not vm_lines and not (bases & self.PVR_TASK_BASES):
+            return ""
+        if vm_lines:
+            grouped: dict = {}
+            for line in vm_lines:
+                key = (line["perforator"], line["charge"])
+                grouped[key] = grouped.get(key, 0) + line["count"]
+            parts = []
+            for (perforator, charge), count in grouped.items():
+                label = f"перфоратор {perforator}, заряд {charge}" if perforator else f"{charge}"
+                parts.append(f"{label} — {count} шт.")
+            return "ПВР: " + "; ".join(parts)
+
+        perforator = ""
+        for _, act in contractor_acts:
+            match = re.search(r'перфоратор\s*\(тип\)\s*[_\s]*([^_]{2,40}?)\s*_*\s*(?:Сработал|после|Заряженн|$)', act, re.IGNORECASE)
+            if match and re.search(r'[A-Za-zА-Яа-я]{2}', match.group(1)):
+                perforator = " ".join(match.group(1).split()).strip(" ,.;:")
+                break
+        count = 0
+        for row in rows:
+            unit = str(row.get("unit") or "")
+            name = str(row.get("name") or "").lower()
+            if "заряд" in unit and ("перфорац" in name or "снаряжен" in name) and isinstance(row.get("volume"), (int, float)):
+                count = max(count, int(row["volume"]))
+        parts = [f"перфоратор {perforator}" if perforator else "перфоратор в акте не указан"]
+        parts.append(f"{count} зарядов" if count else "кол-во зарядов в акт-наряде не указано (ВМ не выставлено)")
+        return "ПВР: " + ", ".join(parts)
+
     def _check_row_costs(self, rows: List[dict]) -> dict:
         """Стоимость строки = объём × расценка × интегральный коэффициент.
         На 1202 строках 139 реальных актов выполняется без единого
@@ -2534,8 +2697,9 @@ class FinalUnifiedParser:
     _ZAYAVKA_TASK_PATTERNS: ClassVar[tuple] = (
         # "ПГИ № 80 (...)" — старый цифровой формат заявки.
         re.compile(r'ПГИ\s*№\s*([0-9]+(?:\.[0-9]+)?(?:\s?\([A-Za-zА-Яа-яЁё]+\))?)'),
-        # "Цель (задача) и интервал исследований: № 24 Опр...."
-        re.compile(r'Цель\s*\(задача\)[^\n]{0,60}?№\s*([0-9]+(?:\.[0-9]+)?(?:\s?\([A-Za-zА-Яа-яЁё]+\))?)'),
+        # "Цель (задача) и интервал исследований: № 24 Опр...." — OCR пишет
+        # и "(залача)", и "№) 24", и "ГИС 581" вместо "№".
+        re.compile(r'Цель\s*\(за[дл]ача\)[^\n]{0,60}?(?:№\)?|ГИС)\s*([0-9]+(?:\.[0-9]+)?(?:\s?\([A-Za-zА-Яа-яЁё]+\))?)'),
         # "Цель, вид, объем заказываемых работ: 87 Опр...." — без "№".
         re.compile(r'Цель,?\s*вид,?\s*объем[^\n]{0,40}?:\s*([0-9]+(?:\.[0-9]+)?(?:\s?\([A-Za-zА-Яа-яЁё]+\))?)'),
         # общий запасной вариант — как в заголовке акт-наряда/акт-заказа.
@@ -2577,7 +2741,29 @@ class FinalUnifiedParser:
             performed_lead = re.match(r'\d+', task)
             if performed_lead and performed_lead.group() == ocr_lead:
                 return True
+        # Заявка на другую задачу — не обязательно ошибка OCR: заказали
+        # одно, выполнили другое (это и надо показать в отчёте). Верим
+        # номеру, если такая задача вообще существует — есть в каталоге
+        # задач (reference/task_catalog.csv), а не случайные цифры скана.
+        if ocr_lead in self._load_known_task_bases():
+            return True
         return not performed_tasks
+
+    _known_task_bases_cache: ClassVar = None
+
+    def _load_known_task_bases(self) -> set:
+        if FinalUnifiedParser._known_task_bases_cache is not None:
+            return FinalUnifiedParser._known_task_bases_cache
+        bases: set = set()
+        try:
+            csv_path = get_reference_dir() / "task_catalog.csv"
+            if csv_path.exists():
+                df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+                bases = {str(v).strip() for v in df.iloc[:, 0].tolist() if str(v).strip()}
+        except Exception:
+            bases = set()
+        FinalUnifiedParser._known_task_bases_cache = bases
+        return bases
 
     def _match_zayavka_task(self, text: str) -> str:
         for pattern in self._ZAYAVKA_TASK_PATTERNS:
@@ -2662,10 +2848,14 @@ class FinalUnifiedParser:
         # Именно ПОЛОЖИТЕЛЬНАЯ формулировка обнаруженной проблемы, а не
         # голый корень "поврежд" — иначе штатное "не имеют явных
         # повреждений" (то есть повреждений НЕТ) ложно считается аномалией.
+        # Бланк акта на ПВР печатает "Сработал/не сработал (нужное
+        # подчеркнуть)" — это вариант выбора, а не отказ перфоратора (акты
+        # 12373, 13101 получали ложное "⚠ см. акт").
+        anomaly_body = re.sub(r'сработал\s*/\s*не\s+сработал', ' ', body, flags=re.IGNORECASE)
         has_anomaly = re.search(
             r'обнаружил[аои]?\s+(?:следующ\w*\s+)?(?:повреждени|дефект)|'
             r'имеются?\s+повреждени|отказ(?:ал)?|брак(?:ован)?|не\s+сработал|негерметичн',
-            body, re.IGNORECASE,
+            anomaly_body, re.IGNORECASE,
         )
         if has_anomaly:
             return "⚠ см. акт: " + body[:150]
@@ -2772,6 +2962,8 @@ class FinalUnifiedParser:
         comment_text = ""
         itp_result = ""
         itp_buffer = ""
+        contractor_acts: List[tuple] = []
+        self._last_contractor_acts = contractor_acts
         pytesseract_module = None
         # Комментарий подрядчика и спецификация перфорации — почти всегда
         # на последних листах пакета (после Справки по зарегистрированному
@@ -2824,6 +3016,14 @@ class FinalUnifiedParser:
                         pytesseract_module = None
                 if pytesseract_module is not None:
                     ocr_text = self._ocr_full_page_text(page, pytesseract_module)
+
+            act_source = text if "нижеподписавш" in text.lower() else (
+                ocr_text if ocr_text and "нижеподписавш" in ocr_text.lower() else ""
+            )
+            if act_source:
+                act_match = re.search(r'составили\s+настоящий\s+[Аа]кт\s*(.*)', act_source, re.IGNORECASE | re.DOTALL)
+                if act_match:
+                    contractor_acts.append((idx, " ".join(act_match.group(1).split())[:1500]))
 
             if not comment_text:
                 if "нижеподписавш" in text.lower():

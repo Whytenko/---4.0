@@ -199,6 +199,10 @@ def build_batch_report(pdf_paths: List[Path], wells_data: List) -> Path:
                 "Итоги акта (арифметика)": _label_bad_details(checks["totals"]),
                 "Реквизиты (акт-наряд vs акт-заказ)": _label_requisites(checks["requisites_zakaz"]),
                 "Имя файла vs акт": _label_bad_details(checks["filename"]),
+                "Задача (лист 1)": well_data.performed_tasks or well_data.task_number,
+                "Задача по заявке": well_data.ordered_task or "не распознана",
+                "Смена задачи (причина)": well_data.task_change_note(),
+                "ПВР (перфоратор, заряды)": well_data.pvr_summary,
             }
         )
 
@@ -272,10 +276,22 @@ def _build_registry_df(wells_data: List) -> pd.DataFrame:
                 # прибора, осмотр перфоратора и т.д.) со страницы "АКТ" —
                 # см. _parse_zayavka_and_comment. Пусто, если такой
                 # страницы в акте нет (обычный, без замечаний акт).
-                "Комментарии": well_data.contractor_comment,
+                "Комментарии": _registry_comment(well_data),
             }
         )
     return pd.DataFrame(rows)
+
+
+def _registry_comment(well_data) -> str:
+    """Комментарий подрядчика + смена задачи (если заявка была на другую
+    задачу) — в реестре заказчика это пишется в той же колонке."""
+    comment = well_data.contractor_comment or ""
+    change = well_data.task_change_note()
+    if not change:
+        return comment
+    if comment in ("", "+"):
+        return change
+    return f"{change}. {comment}"
 
 
 def _to_number(value: str):
